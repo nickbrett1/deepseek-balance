@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -155,11 +156,12 @@ def test_history_empty(client):
 
 
 def test_history_with_data(client):
-    # seed a couple of rows directly through the app's db
+    # seed rows relative to "now" so the test never depends on the wall clock
     db = client.app.state.db
+    now = datetime.now(UTC)
     for i, bal in enumerate([10.0, 20.0, 30.0]):
         db.insert_snapshot(
-            ts=f"2026-08-30T19:{i:02d}:00+00:00",
+            ts=(now - timedelta(minutes=2 - i)).isoformat(),
             currency="CNY",
             total_balance=bal,
             granted_balance=1.0,
