@@ -1,17 +1,16 @@
-"""Default module entry point (python -m deepseek_balance).
+"""Entry point: run the FastAPI app with uvicorn (python -m deepseek_balance)."""
 
-Override the container command via the genproj docker-container "command"
-configuration option (or "entrypoint") when your application needs a custom
-entry point.
-"""
+from __future__ import annotations
 
-import sys
+import os
+
+import uvicorn
 
 
-def main() -> int:
-    print(f"{__package__} is installed and importable.", file=sys.stderr)
-    return 0
+def main() -> None:
+    port = int(os.environ.get("PORT", "3000"))
+    uvicorn.run("deepseek_balance.app:app", host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
