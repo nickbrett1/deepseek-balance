@@ -1,0 +1,68 @@
+version: 2.1
+orbs:
+jobs:
+  build:
+    docker:
+      - image: cimg/python:3.12
+
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-venv-{{ checksum "pyproject.toml" }}
+            - v1-venv-
+      - run:
+          name: Install Packages
+          command: |
+            python3 -m venv .venv
+            echo '. .venv/bin/activate' >> "$BASH_ENV"
+            pip install --upgrade pip
+            pip install -e ".[dev]"
+      - save_cache:
+          paths:
+            - .venv
+          key: v1-venv-{{ checksum "pyproject.toml" }}
+
+      - run:
+          name: Lint (Ruff)
+          command: ruff check src tests
+      - run:
+          name: Test (pytest)
+          command: pytest -v
+
+  docker-publish:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      # BuildKit layer cache ref (ghcr.io registry cache, mode=max). Cache-only
+      # tag — never used as a deployable image.
+      CACHE_REF: ghcr.io/nickbrett1/deepseek-balance:buildcache
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Login to Container Registry
+          command: |
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+      - run:
+          name: Build and Push Image
+          command: |
+            docker buildx create --use --bootstrap || true
+            docker buildx build --platform linux/amd64 \
+              --cache-from type=registry,ref=$CACHE_REF \
+              --cache-to type=registry,ref=$CACHE_REF,mode=max \
+              -t ghcr.io/nickbrett1/deepseek-balance:$CIRCLE_SHA1 -t ghcr.io/nickbrett1/deepseek-balance:latest --push .
+workflows:
+  build-and-test:
+    jobs:
+      - build:
+          context: common
+
+      - docker-publish:
+          context: common
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
