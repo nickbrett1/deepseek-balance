@@ -60,13 +60,13 @@ jobs:
             PKG_NAME="$(basename "$IMAGE" | tr '[:upper:]' '[:lower:]')"
             echo "Setting GHCR package '$PKG_NAME' visibility to 'public'..."
             if ! curl -fsS -X PATCH \
-                -H "Authorization: Bearer $GCHR_TOKEN" \
+                -H "Authorization: Bearer $GHCR_UPDATE_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/user/packages/container/$PKG_NAME/visibility" \
                 -d '{"visibility":"public"}' >/dev/null; then
               echo "User-scope call failed; retrying with org scope 'nickbrett1'..."
               curl -fsS -X PATCH \
-                -H "Authorization: Bearer $GCHR_TOKEN" \
+                -H "Authorization: Bearer $GHCR_UPDATE_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/orgs/nickbrett1/packages/container/$PKG_NAME/visibility" \
                 -d '{"visibility":"public"}' >/dev/null
