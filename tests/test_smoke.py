@@ -2,6 +2,6 @@
 
 
 def test_package_imports():
-    import deepseek_balance  # noqa: F401
+    import deepseek_balance
 
     assert deepseek_balance.__version__
