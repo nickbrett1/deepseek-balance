@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
+from deepseek_balance import mcp_server
 from deepseek_balance.analytics import daily_heartbeat
 from deepseek_balance.app import app
 from deepseek_balance.db import BalanceDB
@@ -344,3 +346,67 @@ def test_daily_endpoint(client):
     assert "rapid_count" in body
     assert "today_points" in body
     assert "spend_summary" in body
+
+
+# --- MCP server timezone awareness ----------------------------------------
+
+def _mcp_server_with_db(tmp_path) -> BalanceDB:
+    """Point the MCP server at a throwaway DB and seed a couple of snapshots."""
+    db = BalanceDB(str(tmp_path / "mcp.db"))
+    _insert(db, "2026-01-15T02:00:00+00:00", 88.0)
+    _insert(db, "2026-01-15T10:00:00+00:00", 82.0)
+    mcp_server._db = db
+    return db
+
+
+@pytest.fixture
+def new_york_tz(monkeypatch):
+    """Force the container's local zone to America/New_York for the test."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+
+
+def test_mcp_today_summary_is_local(new_york_tz, tmp_path):
+    db = _mcp_server_with_db(tmp_path)
+    tool = mcp_server.server._tool_manager._tools["today_summary"]
+    hb = tool.fn(normal_days=14)
+
+    # The timezone must be a real local zone (EDT/EST), never UTC.
+    assert hb["timezone"] in ("EDT", "EST")
+    # local_now must carry a non-UTC offset (America/New_York is UTC-4/-5).
+    assert not hb["local_now"].endswith("+00:00")
+    assert not hb["local_now"].endswith("Z")
+    # The daily view exposes a start_of_day / fraction_elapsed pair.
+    assert "start_of_day" in hb
+    assert "fraction_elapsed" in hb
+    db.close()
+
+
+def test_mcp_spend_tools_are_local(new_york_tz, tmp_path):
+    db = _mcp_server_with_db(tmp_path)
+
+    summary = mcp_server.server._tool_manager._tools["spend_summary"].fn()
+    assert summary["timezone"] in ("EDT", "EST")
+    assert "local_now" in summary
+    assert not summary["local_now"].endswith("+00:00")
+
+    intervals = mcp_server.server._tool_manager._tools["list_spend_intervals"].fn()
+    assert intervals["timezone"] in ("EDT", "EST")
+    assert intervals["local_now"]
+    for i in intervals["intervals"]:
+        assert "ts" in i
+        assert not i["ts"].endswith("+00:00")
+    db.close()
+
+
+def test_mcp_balance_history_is_local(new_york_tz, tmp_path):
+    db = BalanceDB(str(tmp_path / "mcp_history.db"))
+    now = datetime.now().astimezone()
+    _insert(db, (now - timedelta(hours=2)).isoformat(), 95.0)
+    _insert(db, (now - timedelta(hours=1)).isoformat(), 90.0)
+    mcp_server._db = db
+    rows = mcp_server.server._tool_manager._tools["balance_history"].fn(hours=24)
+    assert len(rows) >= 1
+    for r in rows:
+        assert not r["ts"].endswith("+00:00")
+    db.close()

@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -66,21 +66,46 @@ def _tuning() -> dict:
     }
 
 
+def _local_now() -> datetime:
+    """Aware 'now' in the container's local timezone (the TZ env var, e.g.
+    America/New_York). All day-boundary math flows from this, so 'today',
+    midnight, and day-elapsed are in the user's local day, not UTC."""
+    return datetime.now().astimezone()
+
+
+def _tz_name() -> str:
+    try:
+        return _local_now().tzname() or "UTC"
+    except Exception:
+        return "UTC"
+
+
+def _to_local(iso: str) -> str:
+    """Convert an ISO timestamp to the local timezone (ISO with offset)."""
+    try:
+        return datetime.fromisoformat(iso).astimezone().isoformat()
+    except (ValueError, TypeError):
+        return iso
+
+
 def _intervals(hours: int, slice_minutes: int) -> dict:
     tuning = _tuning()
     tuning["spend_slice_minutes"] = slice_minutes
     tuning["summary_hours"] = hours
-    return analytics.spend_intervals(get_db(), datetime.now(UTC), **tuning)
+    return analytics.spend_intervals(get_db(), _local_now(), **tuning)
 
 
 server = MCPServer(
     "deepseek-balance",
     instructions=(
-        "Read-only access to DeepSeek balance spend analytics. Use "
-        "`spend_summary` for aggregate counts over the last N hours and "
-        "`list_spend_intervals` for the individual periods, optionally filtered "
-        "by `bucket` ('high' | 'normal' | 'below'), to investigate why certain "
-        "periods were unusually cheap or expensive."
+        "Read-only access to DeepSeek balance spend analytics. All 'today' / "
+        "day-boundary values are in the server's LOCAL timezone "
+        "(TZ=America/New_York) and every tool returns a `timezone` field and "
+        "local timestamps — do NOT reinterpret them as UTC. For a ready-made "
+        "daily summary of today's spend, use `today_summary` first. Otherwise "
+        "use `spend_summary` for aggregate counts over the last N hours and "
+        "`list_spend_intervals` for individual periods, optionally filtered by "
+        "`bucket` ('high' | 'normal' | 'below')."
     ),
 )
 
@@ -100,10 +125,13 @@ def spend_summary(hours: int = 24, slice_minutes: int = 5) -> dict:
 
     Counts spent intervals and how many were unusually high / around normal /
     below normal (with percentages and the thresholds used). Returns the
-    `summary` and `thresholds` blocks.
+    `summary` and `thresholds` blocks. Timestamps and 'today' boundaries are
+    in the server's local timezone (`timezone`), not UTC.
     """
     si = _intervals(hours, slice_minutes)
     return {
+        "timezone": _tz_name(),
+        "local_now": _local_now().isoformat(),
         "window_hours": si["window_hours"],
         "slice_minutes": si["slice_minutes"],
         "total_slices": si["total_slices"],
@@ -122,9 +150,10 @@ def list_spend_intervals(
 ) -> dict:
     """List individual spend intervals over the last `hours`.
 
-    Each entry has its start time (`ts`, ISO UTC), `spend`, and a `bucket`
-    classification of 'high', 'normal' or 'below' (None before enough data).
-    Pass `bucket` to return only intervals in that classification.
+    Each entry has its start time (`ts`, ISO **local** timezone — see the
+    `timezone` field), `spend`, and a `bucket` classification of 'high',
+    'normal' or 'below' (None before enough data). Pass `bucket` to return
+    only intervals in that classification.
     """
     if bucket not in (None, "high", "normal", "below"):
         raise ValueError("bucket must be one of: high, normal, below (or omitted)")
@@ -132,7 +161,11 @@ def list_spend_intervals(
     intervals = si["intervals"]
     if bucket is not None:
         intervals = [i for i in intervals if i["bucket"] == bucket]
+    for i in intervals:
+        i["ts"] = _to_local(i["ts"])
     return {
+        "timezone": _tz_name(),
+        "local_now": _local_now().isoformat(),
         "window_hours": si["window_hours"],
         "slice_minutes": si["slice_minutes"],
         "total_slices": si["total_slices"],
@@ -144,12 +177,38 @@ def list_spend_intervals(
 
 
 @server.tool()
-def balance_history(hours: int = 24) -> list[dict]:
-    """Raw balance snapshots for the last `hours` (oldest first)."""
-    from datetime import timedelta
+def today_summary(
+    rapid_window_minutes: int = 60,
+    normal_days: int = 14,
+) -> dict:
+    """Daily 'heartbeat' summary for TODAY in the server's local timezone
+    (TZ=America/New_York). Use this instead of reconstructing the day from UTC
+    or from `spend_summary` — it directly returns the local day's `start_of_day`,
+    `fraction_elapsed`, `spent_today`, `normal_spend`, `spend_vs_normal`,
+    `projected_end_balance`, rapid-drop flags, and the spend-interval summary.
+    """
+    hb = analytics.daily_heartbeat(
+        get_db(),
+        _local_now(),
+        rapid_window_minutes=rapid_window_minutes,
+        normal_days=normal_days,
+        **_tuning(),
+    )
+    hb["timezone"] = _tz_name()
+    hb["local_now"] = _local_now().isoformat()
+    return hb
 
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-    return get_db().history(since)
+
+@server.tool()
+def balance_history(hours: int = 24) -> list[dict]:
+    """Raw balance snapshots for the last `hours` (oldest first). Returned
+    timestamps are in the server's local timezone."""
+    since = (_local_now() - timedelta(hours=hours)).isoformat()
+    rows = get_db().history(since)
+    for r in rows:
+        if "ts" in r:
+            r["ts"] = _to_local(r["ts"])
+    return rows
 
 
 def run_stdio() -> None:
