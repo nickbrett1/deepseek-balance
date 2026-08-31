@@ -291,9 +291,9 @@ function renderSummary(d) {
   rows += '<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
     " (" + pctN(s.unusually_high_count) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
   rows += '<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
-    " (" + pctN(s.normal_count) + ")</span></div>";
+    " (" + pctN(s.normal_count) + ") · " + fmt(s.below_floor, d.currency) + "–" + fmt(s.spike_threshold, d.currency) + "</span></div>";
   rows += '<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
-    " (" + pctN(s.below_count) + ")</span></div>";
+    " (" + pctN(s.below_count) + ") · under " + fmt(s.below_floor, d.currency) + "</span></div>";
   el.innerHTML = rows;
 }
 

@@ -195,6 +195,7 @@ def daily_heartbeat(
     enough_data = interval_count >= min_intervals_for_baseline
 
     threshold = None
+    below_floor = None
     high_count = normal_count = below_count = 0
     if enough_data and median_interval is not None:
         spread = _mad(intervals, median_interval)
@@ -218,6 +219,7 @@ def daily_heartbeat(
         "median_interval_spend": median_interval,
         "avg_interval_spend": statistics.mean(intervals) if intervals else None,
         "spike_threshold": threshold,
+        "below_floor": below_floor,
         "unusually_high_count": high_count,
         "unusually_high_pct": (
             (high_count / interval_count * 100) if interval_count else None
