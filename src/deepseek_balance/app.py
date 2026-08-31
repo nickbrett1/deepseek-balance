@@ -271,7 +271,7 @@ function renderSummary(d) {
   const s = d.spend_summary || {};
   const el = document.getElementById("summary");
   document.getElementById("summaryTitle").textContent =
-    "Spend intervals — last " + s.window_hours + "h";
+    "Spend — " + s.slice_minutes + " min intervals · last " + s.window_hours + "h";
   const total = s.intervals_with_spend || 0;
   if (total === 0) {
     el.innerHTML = '<div class="meta">No spend in the last ' + s.window_hours + "h.</div>";
