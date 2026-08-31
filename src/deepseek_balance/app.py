@@ -47,6 +47,32 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _parse_now(now: str | None) -> datetime:
+    """Parse the client's local `now` (ISO with offset); defaults to UTC now."""
+    if now:
+        try:
+            tz_now = datetime.fromisoformat(now)
+        except ValueError:
+            tz_now = datetime.now(UTC)
+        if tz_now.tzinfo is None:
+            tz_now = tz_now.replace(tzinfo=UTC)
+        return tz_now
+    return datetime.now(UTC)
+
+
+def _summary_kwargs() -> dict:
+    """Shared spend-interval tuning pulled from the environment."""
+    return {
+        "spend_slice_minutes": _int_env("SPEND_SLICE_MINUTES", 5),
+        "summary_hours": _int_env("SPEND_SUMMARY_HOURS", 24),
+        "spike_mult": _float_env("SPIKE_MULT", 3.0),
+        "spike_min_ratio": _float_env("SPIKE_MIN_RATIO", 2.0),
+        "min_intervals_for_baseline": _int_env("MIN_INTERVALS_FOR_BASELINE", 10),
+        "normal_band": _float_env("NORMAL_BAND", 2.0),
+        "max_gap_minutes": _int_env("MAX_GAP_MINUTES", 30),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db_path = _env("DB_PATH", "/data/deepseek.db")
@@ -126,30 +152,40 @@ def balance_history(hours: int = 24, step: str = "15m") -> dict:
 def balance_daily(now: str | None = None) -> dict:
     """Daily "heartbeat" summary. `now` is the client's local time (with
     offset) so "today" matches the user's local day; defaults to UTC."""
-    if now:
-        try:
-            tz_now = datetime.fromisoformat(now)
-        except ValueError:
-            tz_now = datetime.now(UTC)
-        if tz_now.tzinfo is None:
-            tz_now = tz_now.replace(tzinfo=UTC)
-    else:
-        tz_now = datetime.now(UTC)
+    tz_now = _parse_now(now)
+    kwargs = _summary_kwargs()
     return analytics.daily_heartbeat(
         app.state.db,
         tz_now,
         rapid_window_minutes=_int_env("RAPID_WINDOW_MINUTES", 60),
         rapid_min_pct=_float_env("RAPID_MIN_PCT", 0.02),
         rapid_mult=_float_env("RAPID_MULT", 2.0),
-        max_gap_minutes=_int_env("MAX_GAP_MINUTES", 30),
         normal_days=_int_env("NORMAL_DAYS", 14),
-        spend_slice_minutes=_int_env("SPEND_SLICE_MINUTES", 5),
-        summary_hours=_int_env("SPEND_SUMMARY_HOURS", 24),
-        spike_mult=_float_env("SPIKE_MULT", 3.0),
-        spike_min_ratio=_float_env("SPIKE_MIN_RATIO", 2.0),
-        min_intervals_for_baseline=_int_env("MIN_INTERVALS_FOR_BASELINE", 10),
-        normal_band=_float_env("NORMAL_BAND", 2.0),
+        **kwargs,
     )
+
+
+@app.get("/spend/intervals")
+def spend_intervals_endpoint(
+    now: str | None = None,
+    hours: int = 24,
+    slice_minutes: int = 5,
+    bucket: str | None = None,
+) -> dict:
+    """Per-spend-interval breakdown for deeper analysis.
+
+    Returns every spent interval (with its start time and a `high`/`normal`/
+    `below` classification) plus the thresholds used. Pass `bucket` to narrow
+    to just one classification. `now` is the client's local time (with offset).
+    """
+    tz_now = _parse_now(now)
+    kwargs = _summary_kwargs()
+    kwargs["spend_slice_minutes"] = slice_minutes
+    kwargs["summary_hours"] = hours
+    data = analytics.spend_intervals(app.state.db, tz_now, **kwargs)
+    if bucket in {"high", "normal", "below"}:
+        data["intervals"] = [i for i in data["intervals"] if i["bucket"] == bucket]
+    return data
 
 
 @app.get("/", response_class=HTMLResponse)

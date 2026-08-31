@@ -79,6 +79,48 @@ environment variables:
 The data endpoint is `/balance/daily` (accepts an optional `now` query param
 carrying the client's local time so "today" matches the viewer's timezone).
 
+## Analysis API & MCP
+
+The per-interval classification is exposed two ways so you can dig into *why*
+a period was cheap or expensive (e.g. correlating a "high" window with what
+was running).
+
+### REST API
+
+`GET /spend/intervals` returns every spent interval over the last `hours`
+(default 24), each with its start time, spend, and a `bucket` classification
+(`high` / `normal` / `below`), plus the thresholds used. Narrow to one
+classification with `bucket=high|normal|below`:
+
+```bash
+# All spent intervals, last 24h, 5-minute slices
+curl "http://localhost:3000/spend/intervals?hours=24&slice_minutes=5"
+
+# Only the unusually-high periods, ready for a deeper dive
+curl "http://localhost:3000/spend/intervals?hours=24&slice_minutes=5&bucket=high"
+```
+
+### MCP server
+
+An MCP server (`deepseek_balance.mcp_server`) lets an agent query the same
+data as tools. Run it over **stdio** (for local agents):
+
+```bash
+python -m deepseek_balance.mcp_server          # or: deepseek-balance-mcp
+```
+
+or over **Streamable HTTP** (for remote agents). The `mcp` service in
+`docker-compose.yml` exposes it on `:3100` (endpoint `http://<host>:3100/mcp`).
+
+Tools exposed:
+
+| Tool                    | Purpose                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `spend_summary`         | Aggregate counts of high / normal / below intervals + thresholds. |
+| `list_spend_intervals`  | Individual intervals, optionally filtered by `bucket`.         |
+| `get_balance_latest`    | Most recent balance snapshot.                                  |
+| `balance_history`       | Raw balance snapshots over the last `hours`.                   |
+
 ## Doppler
 
 This project uses Doppler for secrets from the shared `common` project

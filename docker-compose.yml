@@ -41,3 +41,24 @@ services:
       - "homepage.href=http://nas:8790/"
       - "homepage.widget.type=customapi"
       - "homepage.widget.url=http://localhost:8790/health"
+
+  # MCP server over Streamable HTTP so agents can query spend intervals.
+  # Shares the same SQLite data volume (WAL allows concurrent readers).
+  mcp:
+    image: ghcr.io/nickbrett1/deepseek-balance:latest
+    container_name: deepseek-balance-mcp
+    restart: unless-stopped
+    command: ["python", "-m", "deepseek_balance.mcp_server", "--http", "--host", "0.0.0.0", "--port", "3100"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - /volume1/docker/deepseek-balance:/data
+    environment:
+      DB_PATH: ${DB_PATH:-/data/deepseek.db}
+      SPEND_SLICE_MINUTES: ${SPEND_SLICE_MINUTES:-5}
+      SPEND_SUMMARY_HOURS: ${SPEND_SUMMARY_HOURS:-24}
+      SPIKE_MULT: ${SPIKE_MULT:-3.0}
+      SPIKE_MIN_RATIO: ${SPIKE_MIN_RATIO:-2.0}
+      MIN_INTERVALS_FOR_BASELINE: ${MIN_INTERVALS_FOR_BASELINE:-10}
+      NORMAL_BAND: ${NORMAL_BAND:-2.0}
+      MAX_GAP_MINUTES: ${MAX_GAP_MINUTES:-30}

@@ -56,6 +56,122 @@ def _minutes_between(a: str, b: str) -> float | None:
         return None
 
 
+def spend_intervals(
+    db,
+    now: datetime,
+    *,
+    spend_slice_minutes: int = 5,
+    summary_hours: int = 24,
+    spike_mult: float = SPIKE_MULT,
+    spike_min_ratio: float = SPIKE_MIN_RATIO,
+    min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
+    normal_band: float = 2.0,
+    max_gap_minutes: int = 30,
+) -> dict:
+    """Bucket spend into fixed intervals and classify each spent one.
+
+    Returns thresholds plus one entry per spent interval with its start time
+    and bucket (`high` / `normal` / `below`, or `None` before enough data).
+    The bucket rule uses a robust baseline (median + SPIKE_MULT * MAD) so a
+    single unusually large interval is distinguished from lots of ordinary use.
+    """
+    now_utc = now.astimezone(UTC)
+    slice_seconds = spend_slice_minutes * 60
+    summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
+    sum_rows = db.history(
+        summary_start_utc.isoformat(),
+        before_iso=(now_utc + timedelta(seconds=1)).isoformat(),
+    )
+
+    # Per-interval drops, attributed to the slice the decline ended in.
+    drops: list[tuple[datetime, float]] = []
+    for i in range(1, len(sum_rows)):
+        prev = sum_rows[i - 1]
+        cur = sum_rows[i]
+        if prev["total_balance"] is None or cur["total_balance"] is None:
+            continue
+        gap_min = _minutes_between(prev["ts"], cur["ts"])
+        if gap_min is None or gap_min > max_gap_minutes:
+            continue
+        drop = prev["total_balance"] - cur["total_balance"]
+        if drop > 0:
+            drops.append((datetime.fromisoformat(cur["ts"]), drop))
+
+    n_slices = math.ceil(
+        (now_utc - summary_start_utc).total_seconds() / slice_seconds
+    )
+    spend_by_slice: dict[int, float] = {}
+    for to_ts, drop in drops:
+        idx = math.floor((to_ts - summary_start_utc).total_seconds() / slice_seconds)
+        if 0 <= idx < n_slices:
+            spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
+
+    # Only slices with actual spend become intervals.
+    spent: list[tuple[int, float]] = sorted(
+        ((i, spend) for i, spend in spend_by_slice.items() if spend > 0),
+        key=lambda pair: pair[0],
+    )
+    values = [spend for _, spend in spent]
+    interval_count = len(values)
+    median_interval = _median(values)
+    enough_data = interval_count >= min_intervals_for_baseline
+
+    threshold = None
+    below_floor = None
+    buckets: dict[str, int] = {"high": 0, "normal": 0, "below": 0}
+    if enough_data and median_interval is not None:
+        spread = _mad(values, median_interval)
+        threshold = max(median_interval + spike_mult * spread, median_interval * spike_min_ratio)
+        below_floor = median_interval / normal_band
+
+    intervals: list[dict] = []
+    for idx, spend in spent:
+        bucket = None
+        if threshold is not None and below_floor is not None:
+            if spend > threshold:
+                bucket = "high"
+            elif spend < below_floor:
+                bucket = "below"
+            else:
+                bucket = "normal"
+            buckets[bucket] += 1
+        intervals.append(
+            {
+                "ts": (summary_start_utc + timedelta(seconds=idx * slice_seconds)).isoformat(),
+                "spend": spend,
+                "bucket": bucket,
+            }
+        )
+
+    high_count = buckets["high"]
+    def _pct(n: int) -> float | None:
+        return (n / interval_count * 100) if interval_count else None
+
+    return {
+        "window_hours": summary_hours,
+        "slice_minutes": spend_slice_minutes,
+        "total_slices": n_slices,
+        "enough_data": enough_data,
+        "min_intervals_for_baseline": min_intervals_for_baseline,
+        "thresholds": {
+            "median": median_interval,
+            "avg": statistics.mean(values) if values else None,
+            "spike_threshold": threshold,
+            "below_floor": below_floor,
+        },
+        "summary": {
+            "intervals_with_spend": interval_count,
+            "unusually_high_count": high_count,
+            "unusually_high_pct": _pct(high_count),
+            "normal_count": buckets["normal"],
+            "normal_pct": _pct(buckets["normal"]),
+            "below_count": buckets["below"],
+            "below_pct": _pct(buckets["below"]),
+        },
+        "intervals": intervals,
+    }
+
+
 def daily_heartbeat(
     db,
     now: datetime,
@@ -161,73 +277,34 @@ def daily_heartbeat(
     # any single interval whose spend is a robust statistical outlier (a
     # spike). This separates "one unusually large interval" from "lots of
     # ordinary usage" — the two signals that matter for a balance guard.
-    slice_seconds = spend_slice_minutes * 60
-    summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
-    sum_rows = db.history(
-        summary_start_utc.isoformat(),
-        before_iso=(now_utc + timedelta(seconds=1)).isoformat(),
+    si = spend_intervals(
+        db,
+        now,
+        spend_slice_minutes=spend_slice_minutes,
+        summary_hours=summary_hours,
+        spike_mult=spike_mult,
+        spike_min_ratio=spike_min_ratio,
+        min_intervals_for_baseline=min_intervals_for_baseline,
+        normal_band=normal_band,
+        max_gap_minutes=max_gap_minutes,
     )
-    sum_drops: list[tuple[datetime, float]] = []
-    for i in range(1, len(sum_rows)):
-        prev = sum_rows[i - 1]
-        cur = sum_rows[i]
-        if prev["total_balance"] is None or cur["total_balance"] is None:
-            continue
-        gap_min = _minutes_between(prev["ts"], cur["ts"])
-        if gap_min is None or gap_min > max_gap_minutes:
-            continue
-        drop = prev["total_balance"] - cur["total_balance"]
-        if drop > 0:
-            sum_drops.append((datetime.fromisoformat(cur["ts"]), drop))
-
-    n_slices = math.ceil(
-        (now_utc - summary_start_utc).total_seconds() / slice_seconds
-    )
-    spend_by_slice = [0.0] * n_slices
-    for to_ts, drop in sum_drops:
-        idx = math.floor((to_ts - summary_start_utc).total_seconds() / slice_seconds)
-        if 0 <= idx < n_slices:
-            spend_by_slice[idx] += drop
-
-    intervals = [s for s in spend_by_slice if s > 0]
-    interval_count = len(intervals)
-    median_interval = _median(intervals)
-    enough_data = interval_count >= min_intervals_for_baseline
-
-    threshold = None
-    below_floor = None
-    high_count = normal_count = below_count = 0
-    if enough_data and median_interval is not None:
-        spread = _mad(intervals, median_interval)
-        threshold = max(median_interval + spike_mult * spread, median_interval * spike_min_ratio)
-        below_floor = median_interval / normal_band
-        for spend in intervals:
-            if spend > threshold:
-                high_count += 1
-            elif spend < below_floor:
-                below_count += 1
-            else:
-                normal_count += 1
-
     spend_summary = {
-        "window_hours": summary_hours,
-        "slice_minutes": spend_slice_minutes,
-        "total_slices": n_slices,
-        "intervals_with_spend": interval_count,
-        "enough_data": enough_data,
-        "min_intervals_for_baseline": min_intervals_for_baseline,
-        "median_interval_spend": median_interval,
-        "avg_interval_spend": statistics.mean(intervals) if intervals else None,
-        "spike_threshold": threshold,
-        "below_floor": below_floor,
-        "unusually_high_count": high_count,
-        "unusually_high_pct": (
-            (high_count / interval_count * 100) if interval_count else None
-        ),
-        "normal_count": normal_count,
-        "normal_pct": (normal_count / interval_count * 100) if interval_count else None,
-        "below_count": below_count,
-        "below_pct": (below_count / interval_count * 100) if interval_count else None,
+        "window_hours": si["window_hours"],
+        "slice_minutes": si["slice_minutes"],
+        "total_slices": si["total_slices"],
+        "intervals_with_spend": si["summary"]["intervals_with_spend"],
+        "enough_data": si["enough_data"],
+        "min_intervals_for_baseline": si["min_intervals_for_baseline"],
+        "median_interval_spend": si["thresholds"]["median"],
+        "avg_interval_spend": si["thresholds"]["avg"],
+        "spike_threshold": si["thresholds"]["spike_threshold"],
+        "below_floor": si["thresholds"]["below_floor"],
+        "unusually_high_count": si["summary"]["unusually_high_count"],
+        "unusually_high_pct": si["summary"]["unusually_high_pct"],
+        "normal_count": si["summary"]["normal_count"],
+        "normal_pct": si["summary"]["normal_pct"],
+        "below_count": si["summary"]["below_count"],
+        "below_pct": si["summary"]["below_pct"],
     }
 
     return {

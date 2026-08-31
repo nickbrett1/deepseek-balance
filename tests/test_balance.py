@@ -291,6 +291,36 @@ def test_daily_heartbeat_detects_rapid_drop(tmp_path):
     db.close()
 
 
+def test_spend_intervals_endpoint(client):
+    db = client.app.state.db
+    t0 = datetime.now(UTC) - timedelta(hours=1)
+    bal = 100.0
+    db.insert_snapshot(ts=t0.isoformat(), currency="USD", total_balance=bal,
+                       granted_balance=0.0, topped_up_balance=0.0,
+                       is_available=True, http_status=200, raw="{}")
+    for d in [1.0] * 6 + [0.2] * 3 + [7.0]:
+        bal -= d
+        t0 += timedelta(minutes=5)
+        db.insert_snapshot(ts=t0.isoformat(), currency="USD", total_balance=bal,
+                           granted_balance=0.0, topped_up_balance=0.0,
+                           is_available=True, http_status=200, raw="{}")
+
+    r = client.get("/spend/intervals?hours=24&slice_minutes=5")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["enough_data"] is True
+    assert body["summary"]["intervals_with_spend"] == 10
+    assert body["summary"]["unusually_high_count"] == 1
+    assert len(body["intervals"]) == 10
+    assert any(i["bucket"] == "high" for i in body["intervals"])
+
+    r2 = client.get("/spend/intervals?hours=24&slice_minutes=5&bucket=high")
+    assert r2.status_code == 200
+    high = r2.json()["intervals"]
+    assert len(high) == 1
+    assert all(i["bucket"] == "high" for i in high)
+
+
 def test_daily_endpoint(client):
     db = client.app.state.db
     now = datetime.now(UTC)
