@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from deepseek_balance.analytics import daily_heartbeat
 from deepseek_balance.app import app
 from deepseek_balance.db import BalanceDB
 from deepseek_balance.poller import BalancePoller, CircuitBreaker, parse_interval
@@ -181,3 +182,88 @@ def test_index_serves_chart(client):
     assert r.status_code == 200
     assert "DeepSeek Balance" in r.text
     assert "<svg" in r.text
+
+
+# --- daily heartbeat analytics ----------------------------------------------
+
+def _insert(db, ts, bal, granted=1.0, topped=0.0):
+    db.insert_snapshot(
+        ts=ts,
+        currency="CNY",
+        total_balance=bal,
+        granted_balance=granted,
+        topped_up_balance=topped,
+        is_available=True,
+        http_status=200,
+        raw="{}",
+    )
+
+
+def test_daily_heartbeat_baseline(tmp_path):
+    db = BalanceDB(str(tmp_path / "h.db"))
+    # Yesterday: 100 -> 90 (a ¥10 day).
+    _insert(db, "2026-01-14T08:00:00+00:00", 100.0)
+    _insert(db, "2026-01-14T20:00:00+00:00", 90.0)
+    # Today (so far): 90 -> 82 (¥8 spent at noon).
+    _insert(db, "2026-01-15T02:00:00+00:00", 88.0)
+    _insert(db, "2026-01-15T10:00:00+00:00", 82.0)
+
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)  # noon local
+    d = daily_heartbeat(db, now)
+
+    assert d["current_balance"] == 82.0
+    assert d["prev_balance"] == 90.0
+    assert d["spent_today"] == 8.0
+    assert d["normal_spend"] == 10.0
+    # At noon, half the day elapsed -> projected spend 16, end-of-day 74.
+    assert round(d["projected_spend"], 6) == 16.0
+    assert d["projected_end_balance"] == 74.0
+    assert round(d["spend_vs_normal"], 6) == 1.6
+    # Nothing in the last 60 minutes -> no rapid drops.
+    assert d["rapid_count"] == 0
+    db.close()
+
+
+def test_daily_heartbeat_detects_rapid_drop(tmp_path):
+    db = BalanceDB(str(tmp_path / "r.db"))
+    # Small, normal minute-level drops...
+    _insert(db, "2026-01-15T10:00:00+00:00", 100.0)
+    _insert(db, "2026-01-15T10:10:00+00:00", 99.8)
+    _insert(db, "2026-01-15T10:20:00+00:00", 99.6)
+    _insert(db, "2026-01-15T10:30:00+00:00", 99.5)
+    # ...followed by a single large drop.
+    _insert(db, "2026-01-15T10:40:00+00:00", 70.0)
+
+    now = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
+    d = daily_heartbeat(db, now)
+
+    assert d["rapid_count"] == 1
+    largest = d["largest_rapid"]
+    assert largest["drop"] == pytest.approx(29.5)
+    assert largest["pct"] == pytest.approx(29.5 / 99.5)
+    assert d["current_balance"] == 70.0
+    db.close()
+
+
+def test_daily_endpoint(client):
+    db = client.app.state.db
+    now = datetime.now(UTC)
+    for i, bal in enumerate([100.0, 90.0]):
+        db.insert_snapshot(
+            ts=(now - timedelta(hours=1 - i)).isoformat(),
+            currency="CNY",
+            total_balance=bal,
+            granted_balance=1.0,
+            topped_up_balance=0.0,
+            is_available=True,
+            http_status=200,
+            raw="{}",
+        )
+    r = client.get("/balance/daily")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["current_balance"] == 90.0
+    assert "spent_today" in body
+    assert "projected_end_balance" in body
+    assert "rapid_count" in body
+    assert "today_points" in body

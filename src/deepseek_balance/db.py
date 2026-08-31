@@ -94,18 +94,24 @@ class BalanceDB:
             ).fetchone()
         return dict(row) if row else None
 
-    def history(self, since_iso: str) -> list[dict]:
-        """All rows at-or-after `since_iso`, oldest first."""
+    def history(self, since_iso: str, before_iso: str | None = None) -> list[dict]:
+        """All available rows with `since_iso <= ts < before_iso`, oldest first.
+
+        `before_iso` is optional; when omitted rows are returned from
+        `since_iso` onwards.
+        """
+        sql = """
+            SELECT ts, total_balance, is_available, http_status
+            FROM balance_snapshots
+            WHERE ts >= ? AND total_balance IS NOT NULL
+        """
+        params: list[str] = [since_iso]
+        if before_iso is not None:
+            sql += " AND ts < ?"
+            params.append(before_iso)
+        sql += " ORDER BY ts ASC"
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT ts, total_balance, is_available, http_status
-                FROM balance_snapshots
-                WHERE ts >= ? AND total_balance IS NOT NULL
-                ORDER BY ts ASC
-                """,
-                (since_iso,),
-            ).fetchall()
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in rows]
 
     def close(self) -> None:

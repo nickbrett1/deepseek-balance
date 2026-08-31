@@ -21,8 +21,13 @@ services:
       # Set your environment variables here or in a NAS-side .env file
       # (genproj never commits secrets). See .env.example.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      POLL_INTERVAL: ${POLL_INTERVAL:-15m}
+      POLL_INTERVAL: ${POLL_INTERVAL:-1m}
       DB_PATH: ${DB_PATH:-/data/deepseek.db}
+      RAPID_WINDOW_MINUTES: ${RAPID_WINDOW_MINUTES:-60}
+      RAPID_MIN_PCT: ${RAPID_MIN_PCT:-0.02}
+      RAPID_MULT: ${RAPID_MULT:-2.0}
+      MAX_GAP_MINUTES: ${MAX_GAP_MINUTES:-30}
+      NORMAL_DAYS: ${NORMAL_DAYS:-14}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"

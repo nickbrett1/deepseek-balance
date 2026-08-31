@@ -31,6 +31,38 @@ This project includes the following capabilities:
    pytest -v
    ```
 
+## Homepage widget — daily heartbeat
+
+The homepage widget (served at `/`) is a **daily heartbeat** view rather than a
+raw balance trend chart. It answers three questions at a glance:
+
+- **Spent today & is that normal?** — today's spend compared against the median
+  spend of recent complete days (`NORMAL_DAYS`, default 14), so you can tell at
+  a glance whether you're on track, below average, or pacing above normal.
+- **Projected end-of-day balance** — today's spend pace extended to midnight,
+  giving an expectation of where the balance lands if the pace holds.
+- **Abnormal rapid drops?** — scans the last `RAPID_WINDOW_MINUTES` (default 60)
+  for single-interval declines that are both a meaningful percentage
+  (`RAPID_MIN_PCT`, default 2%) and a clear outlier relative to the recent
+  median per-interval drop (`RAPID_MULT`, default 2×). Any hits surface as a
+  red alert with the largest drop; otherwise a calm "no abnormal drops" line.
+
+To catch rapid drops reliably the poller defaults to `POLL_INTERVAL=1m`
+(granular enough to notice a sudden single-interval decline). Tune the
+detection without touching code via these environment variables:
+
+| Env var               | Default | Meaning                                            |
+| --------------------- | ------- | -------------------------------------------------- |
+| `POLL_INTERVAL`       | `1m`    | Balance polling cadence (finer = catches faster drops). |
+| `RAPID_WINDOW_MINUTES`| `60`    | How far back to look for rapid drops.              |
+| `RAPID_MIN_PCT`       | `0.02`  | Min single-drop % to consider (as a fraction).     |
+| `RAPID_MULT`          | `2.0`   | Outlier multiple vs the recent median drop.        |
+| `MAX_GAP_MINUTES`     | `30`    | Skip comparing drops across gaps wider than this.  |
+| `NORMAL_DAYS`         | `14`    | Days of history used for the "typical day" baseline. |
+
+The data endpoint is `/balance/daily` (accepts an optional `now` query param
+carrying the client's local time so "today" matches the viewer's timezone).
+
 ## Doppler
 
 This project uses Doppler for secrets from the shared `common` project

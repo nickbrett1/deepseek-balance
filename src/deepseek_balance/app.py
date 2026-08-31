@@ -1,6 +1,7 @@
 """deepseek-balance FastAPI application.
 
-Serves `/`, `/balance/latest`, `/balance/history` and `/health`. Starts the
+Serves `/` (the daily-heartbeat homepage widget), `/balance/daily` (its data
+endpoint), `/balance/latest`, `/balance/history` and `/health`. Starts the
 APScheduler poller on startup (lifespan) and stops it on shutdown.
 """
 
@@ -16,6 +17,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+from . import analytics
 from .db import BalanceDB
 from .poller import BalancePoller, parse_interval
 
@@ -23,11 +25,26 @@ logger = logging.getLogger("deepseek_balance.app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 DEFAULT_PORT = 3000
-DEFAULT_INTERVAL = "15m"
+# Finer polling so the "daily heartbeat" can spot rapid single-interval drops.
+DEFAULT_INTERVAL = "1m"
 
 
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 @asynccontextmanager
@@ -105,12 +122,36 @@ def balance_history(hours: int = 24, step: str = "15m") -> dict:
     return {"points": points}
 
 
+@app.get("/balance/daily")
+def balance_daily(now: str | None = None) -> dict:
+    """Daily "heartbeat" summary. `now` is the client's local time (with
+    offset) so "today" matches the user's local day; defaults to UTC."""
+    if now:
+        try:
+            tz_now = datetime.fromisoformat(now)
+        except ValueError:
+            tz_now = datetime.now(UTC)
+        if tz_now.tzinfo is None:
+            tz_now = tz_now.replace(tzinfo=UTC)
+    else:
+        tz_now = datetime.now(UTC)
+    return analytics.daily_heartbeat(
+        app.state.db,
+        tz_now,
+        rapid_window_minutes=_int_env("RAPID_WINDOW_MINUTES", 60),
+        rapid_min_pct=_float_env("RAPID_MIN_PCT", 0.02),
+        rapid_mult=_float_env("RAPID_MULT", 2.0),
+        max_gap_minutes=_int_env("MAX_GAP_MINUTES", 30),
+        normal_days=_int_env("NORMAL_DAYS", 14),
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return CHART_HTML
+    return WIDGET_HTML
 
 
-CHART_HTML = """<!DOCTYPE html>
+WIDGET_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -124,7 +165,21 @@ CHART_HTML = """<!DOCTYPE html>
   .balance { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .balance small { font-size: 11px; font-weight: 500; opacity: .6; }
   .sub { font-size: 10px; opacity: .65; margin-top: 2px; }
-  .chart-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .heart-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(148,163,184,.12); }
+  .row:last-child { border-bottom: 0; }
+  .row .k { opacity: .65; }
+  .row .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .pill { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 999px; margin-left: 4px; vertical-align: 1px; }
+  .pill.ok { background: rgba(52,211,153,.15); color: #6ee7b7; }
+  .pill.warn { background: rgba(251,146,60,.15); color: #fdba74; }
+  .pill.bad { background: rgba(248,113,113,.18); color: #fca5a5; }
+  .pill.muted { background: rgba(148,163,184,.15); color: #94a3b8; }
+  .alert { margin-top: 6px; padding: 6px 8px; border-radius: 6px; font-size: 11px; line-height: 1.4; }
+  .alert.bad { background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.3); color: #fca5a5; }
+  .alert.ok { background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.25); color: #6ee7b7; }
+  .spark-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .spark { margin-top: 2px; }
   .error { color: #f87171; padding: 8px; }
 </style>
 </head>
@@ -133,81 +188,110 @@ CHART_HTML = """<!DOCTYPE html>
   <div class="meta" id="meta">Loading…</div>
   <div class="balance" id="balance">—</div>
   <div class="sub" id="sub"></div>
-  <div class="chart-title">Balance over time</div>
-  <div id="chart">Loading…</div>
+  <div class="heart-title">Today’s heartbeat</div>
+  <div id="heart">Loading…</div>
+  <div class="alert" id="alert" hidden></div>
+  <div class="spark-title">Today’s balance</div>
+  <div class="spark" id="spark"></div>
 <script>
-const LATEST = "/balance/latest";
-const HISTORY = "/balance/history?hours=24&step=15m";
+const DAILY = "/balance/daily";
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+// Local ISO-8601 timestamp with offset so the server's "today" matches ours.
+function localIso() {
+  const d = new Date();
+  const off = -d.getTimezoneOffset();            // minutes east of UTC
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const tz = sign + pad(Math.floor(abs / 60)) + ":" + pad(abs % 60);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
+    "." + String(d.getMilliseconds()).padStart(3, "0") + tz;
+}
+
+function fmt(v, cur) {
+  if (v == null) return "—";
+  return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
+}
 
 async function load() {
   try {
-    const [lr, hr] = await Promise.all([
-      fetch(LATEST, { cache: "no-store" }),
-      fetch(HISTORY, { cache: "no-store" }),
-    ]);
-    if (!lr.ok) throw new Error("HTTP " + lr.status);
-    const latest = await lr.json();
-    const hist = hr.ok ? await hr.json() : { points: [] };
-    renderHeader(latest);
-    renderChart(hist.points || []);
-  } catch (e) {
-    document.getElementById("chart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
-  }
-}
-
-function fmt(v) {
-  return (v == null ? "—" : Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }));
-}
-
-function renderHeader(latest) {
-  const el = document.getElementById("balance");
-  if (latest.error || latest.total_balance == null) {
-    el.textContent = "No data yet";
-    return;
-  }
-  el.innerHTML = fmt(latest.total_balance) + " <small>" + (latest.currency || "") + "</small>";
-  document.getElementById("sub").textContent =
-    "granted " + fmt(latest.granted_balance) + " · topped up " + fmt(latest.topped_up_balance);
-  const d = new Date(latest.ts);
-  document.getElementById("meta").textContent =
-    "Updated " + (d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " +
-    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }));
-}
-
-function renderChart(points) {
-  if (points.length < 2) {
-    document.getElementById("chart").innerHTML = '<div class="meta">Not enough data yet</div>';
-    return;
-  }
-  const W = 320, H = 84, padL = 6, padR = 6, padT = 8, padB = 16;
-  const vals = points.map((p) => p.total_balance);
-  const maxV = Math.max(...vals), minV = Math.min(...vals);
-  const range = Math.max(maxV - minV, 1);
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const x = (i) => padL + (points.length === 1 ? plotW / 2 : (i * plotW) / (points.length - 1));
-  const y = (v) => padT + ((maxV - v) / range) * plotH;
-  const pts = points.map((p, i) => x(i).toFixed(1) + "," + y(p.total_balance).toFixed(1));
-  let area = "M" + pts[0];
-  for (let i = 1; i < pts.length; i++) area += " L" + pts[i];
-  area += " L" + x(points.length - 1).toFixed(1) + "," + (padT + plotH).toFixed(1) +
-          " L" + x(0).toFixed(1) + "," + (padT + plotH).toFixed(1) + " Z";
-  let circles = "";
-  let labels = "";
-  points.forEach((p, i) => {
-    const cx = x(i).toFixed(1), cy = y(p.total_balance).toFixed(1);
-    circles += '<circle cx="' + cx + '" cy="' + cy + '" r="2.2" fill="#60a5fa">'
-      + "<title>" + new Date(p.ts).toLocaleString() + ": " + fmt(p.total_balance) + "</title></circle>";
-    if (i === 0 || i === points.length - 1 || i % 4 === 0) {
-      const t = new Date(p.ts);
-      labels += '<text x="' + cx + '" y="' + (H - 4) + '" font-size="8" text-anchor="middle" opacity=".55">'
-        + t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) + "</text>";
+    const r = await fetch(DAILY + "?now=" + encodeURIComponent(localIso()), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (d.error || d.current_balance == null) {
+      document.getElementById("balance").textContent = "No data yet";
+      document.getElementById("heart").innerHTML = '<div class="meta">Waiting for the first snapshot…</div>';
+      return;
     }
-  });
-  const svg = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px" preserveAspectRatio="xMidYMid meet">'
-    + '<path d="' + area + '" fill="rgba(96,165,250,.12)" stroke="none"/>'
-    + '<polyline points="' + pts.join(" ") + '" fill="none" stroke="#60a5fa" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>'
-    + circles + labels + "</svg>";
-  document.getElementById("chart").innerHTML = svg;
+    renderHeader(d);
+    renderHeart(d);
+    renderAlert(d);
+    renderSpark(d);
+  } catch (e) {
+    document.getElementById("heart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
+  }
+}
+
+function renderHeader(d) {
+  document.getElementById("balance").innerHTML =
+    fmt(d.current_balance) + " <small>" + (d.currency || "") + "</small>";
+  document.getElementById("sub").textContent = "started the day at " + fmt(d.prev_balance, d.currency);
+  const t = new Date(d.current_ts);
+  document.getElementById("meta").textContent =
+    "Updated " + t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
+    " · " + t.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function pacing(svn) {
+  if (svn == null) return ["muted", "no baseline"];
+  if (svn < 0.7) return ["ok", "below avg"];
+  if (svn <= 1.3) return ["ok", "on track"];
+  return ["warn", "above normal"];
+}
+
+function renderHeart(d) {
+  const [cls, label] = pacing(d.spend_vs_normal);
+  const pill = '<span class="pill ' + cls + '">' + label + "</span>";
+  const rows = [
+    { k: "Spent today", v: fmt(d.spent_today, d.currency) + pill },
+    { k: "Typical day", v: fmt(d.normal_spend, d.currency) },
+    { k: "Projected end of day", v: fmt(d.projected_end_balance, d.currency) },
+  ];
+  document.getElementById("heart").innerHTML = rows.map((r) =>
+    '<div class="row"><span class="k">' + r.k + '</span><span class="v">' + r.v + "</span></div>"
+  ).join("");
+}
+
+function renderAlert(d) {
+  const el = document.getElementById("alert");
+  el.hidden = false;
+  if (d.rapid_count > 0) {
+    el.className = "alert bad";
+    const l = d.largest_rapid;
+    el.innerHTML = "⚠ " + d.rapid_count + (d.rapid_count === 1 ? " rapid drop" : " rapid drops") +
+      " in the last " + d.rapid_window_minutes + " min — largest " +
+      fmt(l.drop, d.currency) + " (" + (l.pct * 100).toFixed(1) + "%)";
+  } else {
+    el.className = "alert ok";
+    el.innerHTML = "✓ No abnormal drops in the last " + d.rapid_window_minutes + " min.";
+  }
+}
+
+function renderSpark(d) {
+  const pts = d.today_points || [];
+  const el = document.getElementById("spark");
+  if (pts.length < 2) { el.innerHTML = ""; return; }
+  const W = 320, H = 34, p = 4;
+  const vals = pts.map((q) => q.total_balance);
+  const maxV = Math.max(...vals), minV = Math.min(...vals);
+  const range = Math.max(maxV - minV, 1e-9);
+  const x = (i) => p + (pts.length === 1 ? (W - 2 * p) / 2 : (i * (W - 2 * p)) / (pts.length - 1));
+  const y = (v) => p + ((maxV - v) / range) * (H - 2 * p);
+  const line = pts.map((q, i) => x(i).toFixed(1) + "," + y(q.total_balance).toFixed(1)).join(" ");
+  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block" preserveAspectRatio="none">'
+    + '<polyline points="' + line + '" fill="none" stroke="#60a5fa" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 }
 
 load();
