@@ -70,6 +70,7 @@ def daily_heartbeat(
     spike_mult: float = SPIKE_MULT,
     spike_min_ratio: float = SPIKE_MIN_RATIO,
     min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
+    normal_band: float = 2.0,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -194,11 +195,18 @@ def daily_heartbeat(
     enough_data = interval_count >= min_intervals_for_baseline
 
     threshold = None
-    high_count = 0
+    high_count = normal_count = below_count = 0
     if enough_data and median_interval is not None:
         spread = _mad(intervals, median_interval)
         threshold = max(median_interval + spike_mult * spread, median_interval * spike_min_ratio)
-        high_count = sum(1 for s in intervals if s > threshold)
+        below_floor = median_interval / normal_band
+        for spend in intervals:
+            if spend > threshold:
+                high_count += 1
+            elif spend < below_floor:
+                below_count += 1
+            else:
+                normal_count += 1
 
     spend_summary = {
         "window_hours": summary_hours,
@@ -214,6 +222,10 @@ def daily_heartbeat(
         "unusually_high_pct": (
             (high_count / interval_count * 100) if interval_count else None
         ),
+        "normal_count": normal_count,
+        "normal_pct": (normal_count / interval_count * 100) if interval_count else None,
+        "below_count": below_count,
+        "below_pct": (below_count / interval_count * 100) if interval_count else None,
     }
 
     return {

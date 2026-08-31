@@ -148,6 +148,7 @@ def balance_daily(now: str | None = None) -> dict:
         spike_mult=_float_env("SPIKE_MULT", 3.0),
         spike_min_ratio=_float_env("SPIKE_MIN_RATIO", 2.0),
         min_intervals_for_baseline=_int_env("MIN_INTERVALS_FOR_BASELINE", 10),
+        normal_band=_float_env("NORMAL_BAND", 2.0),
     )
 
 
@@ -286,10 +287,13 @@ function renderSummary(d) {
       " spent intervals to judge unusual spend — " + total + " so far" + (need ? " (" + need + " more)" : "") + ".</div>";
     return;
   }
-  const high = s.unusually_high_count || 0;
-  const warn = high > 0 ? "up" : "at";
-  rows += '<div class="row"><span class="k">Unusually high</span><span class="v ' + warn + '">' + high +
-    " (" + pct(high) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
+  const pctN = (n) => pct(n || 0);
+  rows += '<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
+    " (" + pctN(s.unusually_high_count) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
+  rows += '<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
+    " (" + pctN(s.normal_count) + ")</span></div>";
+  rows += '<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
+    " (" + pctN(s.below_count) + ")</span></div>";
   el.innerHTML = rows;
 }
 

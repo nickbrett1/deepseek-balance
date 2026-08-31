@@ -245,24 +245,28 @@ def test_daily_heartbeat_spend_summary_needs_data(tmp_path):
 
 def test_daily_heartbeat_spend_summary_flags_spike(tmp_path):
     db = BalanceDB(str(tmp_path / "sp.db"))
-    # 13 ordinary ¥1 intervals then one ¥7 outlier -> the spike is flagged.
+    # 6 ¥1 intervals (normal), 3 ¥0.2 intervals (below) and one ¥7 spike.
+    drops = [1.0] * 6 + [0.2] * 3 + [7.0]
     t0 = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
     bal = 100.0
-    for i in range(14):
+    _insert(db, t0.isoformat(), bal)
+    for i, d in enumerate(drops, start=1):
+        bal -= d
         _insert(db, (t0 + timedelta(minutes=5 * i)).isoformat(), bal)
-        bal -= 1.0  # 13 drops of ¥1 between the 14 snapshots
-    # A final ¥7 drop makes one interval clearly abnormal.
-    _insert(db, (t0 + timedelta(minutes=5 * 14)).isoformat(), 80.0)
 
     now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
     s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
 
-    assert s["intervals_with_spend"] == 14
+    assert s["intervals_with_spend"] == 10
     assert s["enough_data"] is True
     assert s["median_interval_spend"] == pytest.approx(1.0)
     assert s["spike_threshold"] == pytest.approx(2.0)
     assert s["unusually_high_count"] == 1
-    assert s["unusually_high_pct"] == pytest.approx(1 / 14 * 100)
+    assert s["normal_count"] == 6
+    assert s["below_count"] == 3
+    assert s["unusually_high_pct"] == pytest.approx(10.0)
+    assert s["normal_pct"] == pytest.approx(60.0)
+    assert s["below_pct"] == pytest.approx(30.0)
     db.close()
 
 

@@ -50,7 +50,9 @@ raw balance trend chart. It answers three questions at a glance:
   the two signals that matter: *one abnormally large interval* vs. *lots of
   ordinary usage* (many intervals, none individually high), which is fine. The
   spike rule is `median + SPIKE_MULT × MAD`, and always at least
-  `SPIKE_MIN_RATIO × median`. Until there are at least
+  `SPIKE_MIN_RATIO × median`. Every spent interval is bucketed into
+  **unusually high** / **around normal** / **below normal** (below = less than
+  `1/NORMAL_BAND` of the median interval spend). Until there are at least
   `MIN_INTERVALS_FOR_BASELINE` spent intervals in the window, the widget says
   "not enough data" instead of guessing.
 
@@ -68,6 +70,7 @@ environment variables:
 | `SPIKE_MULT`               | `3.0`   | Outlier multiple vs the interval spread (MAD). |
 | `SPIKE_MIN_RATIO`          | `2.0`   | A spike must always be at least this × median. |
 | `MIN_INTERVALS_FOR_BASELINE` | `10`  | Spent intervals needed before judging spikes.  |
+| `NORMAL_BAND`              | `2.0`   | "Below normal" = less than 1/this × median.    |
 
 > **Timezones:** the widget asks `/balance/daily` with the browser's local time
 > (including its UTC offset), so "today", the heartbeat day, and the summary
