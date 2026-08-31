@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -76,7 +76,7 @@ def _local_now() -> datetime:
 def _tz_name() -> str:
     try:
         return _local_now().tzname() or "UTC"
-    except Exception:
+    except (ValueError, TypeError):
         return "UTC"
 
 
