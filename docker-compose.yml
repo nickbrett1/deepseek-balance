@@ -30,6 +30,9 @@ services:
       NORMAL_DAYS: ${NORMAL_DAYS:-14}
       SPEND_SLICE_MINUTES: ${SPEND_SLICE_MINUTES:-5}
       SPEND_SUMMARY_HOURS: ${SPEND_SUMMARY_HOURS:-24}
+      SPIKE_MULT: ${SPIKE_MULT:-3.0}
+      SPIKE_MIN_RATIO: ${SPIKE_MIN_RATIO:-2.0}
+      MIN_INTERVALS_FOR_BASELINE: ${MIN_INTERVALS_FOR_BASELINE:-10}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"

@@ -23,10 +23,14 @@ from datetime import UTC, datetime, timedelta
 
 DAY_SECONDS = 86400.0
 
-# Thresholds (as multiples of the per-slice expected spend) used to bucket a
-# bar as under / at / above expectations. Mirrors the widget's pacing pill.
-_UNDER = 0.7
-_AT = 1.3
+# A "spend interval" is flagged as unusually high when it exceeds the robust
+# baseline (median + SPIKE_MULT * MAD) — and is always at least SPIKE_MIN_RATIO
+# times the median, so near-median jitter is never called a spike. The summary
+# needs at least MIN_INTERVALS_FOR_BASELINE spent intervals to trust that
+# baseline; below that it reports "not enough data" instead of guessing.
+SPIKE_MULT = 3.0
+SPIKE_MIN_RATIO = 2.0
+MIN_INTERVALS_FOR_BASELINE = 10
 
 
 def _start_of_day_local(dt: datetime) -> datetime:
@@ -38,6 +42,11 @@ def _start_of_day_local(dt: datetime) -> datetime:
 
 def _median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
+
+
+def _mad(values: list[float], center: float) -> float:
+    """Median absolute deviation, a robust measure of spread."""
+    return _median([abs(v - center) for v in values]) or 0.0
 
 
 def _minutes_between(a: str, b: str) -> float | None:
@@ -58,6 +67,9 @@ def daily_heartbeat(
     normal_days: int = 14,
     spend_slice_minutes: int = 5,
     summary_hours: int = 24,
+    spike_mult: float = SPIKE_MULT,
+    spike_min_ratio: float = SPIKE_MIN_RATIO,
+    min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -144,9 +156,10 @@ def daily_heartbeat(
     largest_rapid = max(rapid, key=lambda d: d["drop"]) if rapid else None
 
     # --- spend-interval summary over the last `summary_hours` ---------------
-    # Buckets spend into fixed slices, ignores slices with no spend, and
-    # classifies each spent interval as under / at / above the per-slice share
-    # of a typical day. This replaces the raw chart with actionable insight.
+    # Buckets spend into fixed slices, ignores zero-spend slices, then flags
+    # any single interval whose spend is a robust statistical outlier (a
+    # spike). This separates "one unusually large interval" from "lots of
+    # ordinary usage" — the two signals that matter for a balance guard.
     slice_seconds = spend_slice_minutes * 60
     summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
     sum_rows = db.history(
@@ -175,50 +188,31 @@ def daily_heartbeat(
         if 0 <= idx < n_slices:
             spend_by_slice[idx] += drop
 
-    expected_per_slice = (
-        (normal_spend * slice_seconds / DAY_SECONDS) if normal_spend else None
-    )
-    buckets: dict[str, list[float]] = {"above": [], "at": [], "under": []}
-    intervals_with_spend = 0
-    for spend in spend_by_slice:
-        if spend <= 0:
-            continue
-        intervals_with_spend += 1
-        if expected_per_slice is None:
-            continue
-        ratio = spend / expected_per_slice
-        if ratio > _AT:
-            buckets["above"].append(spend)
-        elif ratio < _UNDER:
-            buckets["under"].append(spend)
-        else:
-            buckets["at"].append(spend)
+    intervals = [s for s in spend_by_slice if s > 0]
+    interval_count = len(intervals)
+    median_interval = _median(intervals)
+    enough_data = interval_count >= min_intervals_for_baseline
 
-    def _agg(values: list[float]) -> dict:
-        return {
-            "count": len(values),
-            "min": min(values) if values else None,
-            "max": max(values) if values else None,
-            "avg": statistics.mean(values) if values else None,
-        }
+    threshold = None
+    high_count = 0
+    if enough_data and median_interval is not None:
+        spread = _mad(intervals, median_interval)
+        threshold = max(median_interval + spike_mult * spread, median_interval * spike_min_ratio)
+        high_count = sum(1 for s in intervals if s > threshold)
 
-    above_count = len(buckets["above"])
     spend_summary = {
         "window_hours": summary_hours,
         "slice_minutes": spend_slice_minutes,
         "total_slices": n_slices,
-        "intervals_with_spend": intervals_with_spend,
-        "expected_per_slice": expected_per_slice,
-        "has_baseline": expected_per_slice is not None,
-        "buckets": {
-            "above": _agg(buckets["above"]),
-            "at": _agg(buckets["at"]),
-            "under": _agg(buckets["under"]),
-        },
-        "percent_above": (
-            (above_count / intervals_with_spend * 100)
-            if intervals_with_spend and expected_per_slice is not None
-            else None
+        "intervals_with_spend": interval_count,
+        "enough_data": enough_data,
+        "min_intervals_for_baseline": min_intervals_for_baseline,
+        "median_interval_spend": median_interval,
+        "avg_interval_spend": statistics.mean(intervals) if intervals else None,
+        "spike_threshold": threshold,
+        "unusually_high_count": high_count,
+        "unusually_high_pct": (
+            (high_count / interval_count * 100) if interval_count else None
         ),
     }
 

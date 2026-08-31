@@ -145,6 +145,9 @@ def balance_daily(now: str | None = None) -> dict:
         normal_days=_int_env("NORMAL_DAYS", 14),
         spend_slice_minutes=_int_env("SPEND_SLICE_MINUTES", 5),
         summary_hours=_int_env("SPEND_SUMMARY_HOURS", 24),
+        spike_mult=_float_env("SPIKE_MULT", 3.0),
+        spike_min_ratio=_float_env("SPIKE_MIN_RATIO", 2.0),
+        min_intervals_for_baseline=_int_env("MIN_INTERVALS_FOR_BASELINE", 10),
     )
 
 
@@ -275,21 +278,18 @@ function renderSummary(d) {
     return;
   }
   const pct = (n) => Math.round((n / total) * 100) + "%";
-  const b = (key, cls) => {
-    const x = (s.buckets || {})[key] || {};
-    const n = x.count || 0;
-    if (n === 0) {
-      return '<div class="row"><span class="k">' + key + '</span><span class="v ' + cls + '">' + n + "</span></div>";
-    }
-    return '<div class="row"><span class="k">' + key + '</span><span class="v ' + cls + '">' + n + " (" + pct(n) +
-      ") · avg " + fmt(x.avg, d.currency) + " · " + fmt(x.min, d.currency) + "–" + fmt(x.max, d.currency) + "</span></div>";
-  };
   let rows = '<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>";
-  if (!s.has_baseline) {
-    el.innerHTML = rows + '<div class="meta">No baseline yet — add "typical day" spend to see over/under.</div>';
+  rows += '<div class="row"><span class="k">Median interval</span><span class="v">' + fmt(s.median_interval_spend, d.currency) + "</span></div>";
+  if (!s.enough_data) {
+    const need = Math.max(0, s.min_intervals_for_baseline - total);
+    el.innerHTML = rows + '<div class="meta">Need ' + s.min_intervals_for_baseline +
+      " spent intervals to judge unusual spend — " + total + " so far" + (need ? " (" + need + " more)" : "") + ".</div>";
     return;
   }
-  rows += b("above", "up") + b("at", "at") + b("under", "dn");
+  const high = s.unusually_high_count || 0;
+  const warn = high > 0 ? "up" : "at";
+  rows += '<div class="row"><span class="k">Unusually high</span><span class="v ' + warn + '">' + high +
+    " (" + pct(high) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
   el.innerHTML = rows;
 }
 

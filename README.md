@@ -43,23 +43,31 @@ raw balance trend chart. It answers three questions at a glance:
   know how much the day is shaping up to cost if the current pace holds.
 - **Spend-interval summary** — over the last `SPEND_SUMMARY_HOURS` (default 24)
   the widget counts how many `SPEND_SLICE_MINUTES` intervals actually had spend
-  (zero-spend intervals are ignored), then splits them into how many were
-  **above**, **at**, or **below** the per-slice share of your typical daily
-  spend. For each bucket it shows the count, the percentage of spent intervals,
-  and the range + average spend. The percentage of "above" intervals is the
-  headline signal — e.g. "5 intervals (30%) · avg ¥3.2 · ¥0.5–¥12.4".
+  (zero-spend intervals are ignored), plus the median interval spend. It then
+  flags a single interval as **unusually high** only when its spend is a robust
+  statistical outlier vs. the recent interval distribution — a spike — rather
+  than when it merely exceeds a tiny share of your daily budget. This separates
+  the two signals that matter: *one abnormally large interval* vs. *lots of
+  ordinary usage* (many intervals, none individually high), which is fine. The
+  spike rule is `median + SPIKE_MULT × MAD`, and always at least
+  `SPIKE_MIN_RATIO × median`. Until there are at least
+  `MIN_INTERVALS_FOR_BASELINE` spent intervals in the window, the widget says
+  "not enough data" instead of guessing.
 
 The poller defaults to `POLL_INTERVAL=1m` (granular enough to notice a sudden
 single-interval decline). Tune the detection without touching code via these
 environment variables:
 
-| Env var                | Default | Meaning                                           |
-| ---------------------- | ------- | ------------------------------------------------- |
-| `POLL_INTERVAL`        | `1m`    | Balance polling cadence (finer = catches faster drops). |
-| `MAX_GAP_MINUTES`      | `30`    | Skip comparing drops across gaps wider than this. |
-| `NORMAL_DAYS`          | `14`    | Days of history used for the "typical day" baseline. |
-| `SPEND_SLICE_MINUTES`  | `5`     | Width of each spend interval in the summary.      |
-| `SPEND_SUMMARY_HOURS`  | `24`    | How far back the spend-interval summary looks.    |
+| Env var                    | Default | Meaning                                        |
+| -------------------------- | ------- | ---------------------------------------------- |
+| `POLL_INTERVAL`            | `1m`    | Balance polling cadence (finer = catches faster drops). |
+| `MAX_GAP_MINUTES`          | `30`    | Skip comparing drops across gaps wider than this. |
+| `NORMAL_DAYS`              | `14`    | Days of history used for the "typical day" baseline. |
+| `SPEND_SLICE_MINUTES`      | `5`     | Width of each spend interval in the summary.   |
+| `SPEND_SUMMARY_HOURS`      | `24`    | How far back the spend-interval summary looks. |
+| `SPIKE_MULT`               | `3.0`   | Outlier multiple vs the interval spread (MAD). |
+| `SPIKE_MIN_RATIO`          | `2.0`   | A spike must always be at least this × median. |
+| `MIN_INTERVALS_FOR_BASELINE` | `10`  | Spent intervals needed before judging spikes.  |
 
 > **Timezones:** the widget asks `/balance/daily` with the browser's local time
 > (including its UTC offset), so "today", the heartbeat day, and the summary

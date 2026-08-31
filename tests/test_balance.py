@@ -225,30 +225,44 @@ def test_daily_heartbeat_baseline(tmp_path):
     db.close()
 
 
-def test_daily_heartbeat_spend_summary(tmp_path):
+def test_daily_heartbeat_spend_summary_needs_data(tmp_path):
     db = BalanceDB(str(tmp_path / "s.db"))
-    # A ¥20 "typical day" yesterday establishes the per-slice expectation.
-    _insert(db, "2026-01-14T08:00:00+00:00", 100.0)
-    _insert(db, "2026-01-14T20:00:00+00:00", 80.0)
-    # Today: two spent intervals within the 24h summary window.
+    # Only a couple of spent intervals in the 24h window -> not enough data yet.
     _insert(db, "2026-01-15T10:00:00+00:00", 80.0)
     _insert(db, "2026-01-15T10:06:00+00:00", 79.9)
     _insert(db, "2026-01-15T10:12:00+00:00", 78.0)
 
     now = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
-    d = daily_heartbeat(db, now, spend_slice_minutes=5)
+    s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
 
-    s = d["spend_summary"]
-    assert s["has_baseline"] is True
     assert s["intervals_with_spend"] == 2
-    above = s["buckets"]["above"]
-    assert above["count"] == 2
-    assert above["min"] == pytest.approx(0.1)
-    assert above["max"] == pytest.approx(1.9)
-    assert above["avg"] == pytest.approx(1.0)
-    assert s["buckets"]["at"]["count"] == 0
-    assert s["buckets"]["under"]["count"] == 0
-    assert s["percent_above"] == pytest.approx(100.0)
+    assert s["enough_data"] is False
+    assert s["median_interval_spend"] == pytest.approx(1.0)
+    assert s["spike_threshold"] is None
+    assert s["unusually_high_count"] == 0
+    db.close()
+
+
+def test_daily_heartbeat_spend_summary_flags_spike(tmp_path):
+    db = BalanceDB(str(tmp_path / "sp.db"))
+    # 13 ordinary ¥1 intervals then one ¥7 outlier -> the spike is flagged.
+    t0 = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
+    bal = 100.0
+    for i in range(14):
+        _insert(db, (t0 + timedelta(minutes=5 * i)).isoformat(), bal)
+        bal -= 1.0  # 13 drops of ¥1 between the 14 snapshots
+    # A final ¥7 drop makes one interval clearly abnormal.
+    _insert(db, (t0 + timedelta(minutes=5 * 14)).isoformat(), 80.0)
+
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
+
+    assert s["intervals_with_spend"] == 14
+    assert s["enough_data"] is True
+    assert s["median_interval_spend"] == pytest.approx(1.0)
+    assert s["spike_threshold"] == pytest.approx(2.0)
+    assert s["unusually_high_count"] == 1
+    assert s["unusually_high_pct"] == pytest.approx(1 / 14 * 100)
     db.close()
 
 
