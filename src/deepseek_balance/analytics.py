@@ -17,10 +17,16 @@ query is converted to UTC because the stored snapshot timestamps are UTC.
 
 from __future__ import annotations
 
+import math
 import statistics
 from datetime import UTC, datetime, timedelta
 
 DAY_SECONDS = 86400.0
+
+# Thresholds (as multiples of the per-slice expected spend) used to bucket a
+# bar as under / at / above expectations. Mirrors the widget's pacing pill.
+_UNDER = 0.7
+_AT = 1.3
 
 
 def _start_of_day_local(dt: datetime) -> datetime:
@@ -50,6 +56,7 @@ def daily_heartbeat(
     rapid_mult: float = 2.0,
     max_gap_minutes: int = 30,
     normal_days: int = 14,
+    spend_slice_minutes: int = 5,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -135,6 +142,45 @@ def daily_heartbeat(
     ]
     largest_rapid = max(rapid, key=lambda d: d["drop"]) if rapid else None
 
+    # --- spend per time slice in the recent window (bar chart data) ---------
+    slice_seconds = spend_slice_minutes * 60
+    window_duration = max((now_utc - window_start_utc).total_seconds(), slice_seconds)
+    n_slices = math.ceil(window_duration / slice_seconds)
+    spend_by_slice = [0.0] * n_slices
+    for d in drops:
+        to_ts = datetime.fromisoformat(d["to_ts"])
+        idx = math.floor((to_ts - window_start_utc).total_seconds() / slice_seconds)
+        if 0 <= idx < n_slices:
+            spend_by_slice[idx] += d["drop"]
+
+    expected_per_slice = (
+        (normal_spend * slice_seconds / DAY_SECONDS) if normal_spend else None
+    )
+    recent_spend: list[dict] = []
+    for i in range(n_slices):
+        slice_start = window_start_utc + timedelta(seconds=i * slice_seconds)
+        spend = spend_by_slice[i]
+        expected = expected_per_slice
+        # The final slice is usually partial; scale its expectation to the
+        # fraction of that slice that has actually elapsed.
+        if expected_per_slice is not None:
+            elapsed = min((now_utc - slice_start).total_seconds(), slice_seconds)
+            expected = expected_per_slice * (elapsed / slice_seconds)
+        status = None
+        if expected:
+            ratio = spend / expected
+            status = "at" if ratio <= _AT else "above"
+            if ratio < _UNDER:
+                status = "under"
+        recent_spend.append(
+            {
+                "ts": slice_start.isoformat(),
+                "spend": spend,
+                "expected": expected,
+                "status": status,
+            }
+        )
+
     return {
         "currency": currency,
         "current_balance": current_balance,
@@ -152,4 +198,6 @@ def daily_heartbeat(
         "rapid_count": len(rapid),
         "largest_rapid": largest_rapid,
         "today_points": today_points,
+        "recent_spend": recent_spend,
+        "spend_slice_minutes": spend_slice_minutes,
     }

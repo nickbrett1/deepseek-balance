@@ -224,6 +224,30 @@ def test_daily_heartbeat_baseline(tmp_path):
     db.close()
 
 
+def test_daily_heartbeat_recent_spend_bars(tmp_path):
+    db = BalanceDB(str(tmp_path / "s.db"))
+    # A ¥20 "typical day" yesterday establishes the per-slice expectation.
+    _insert(db, "2026-01-14T08:00:00+00:00", 100.0)
+    _insert(db, "2026-01-14T20:00:00+00:00", 80.0)
+    # Today: small drop then a bigger one, both inside the recent window.
+    _insert(db, "2026-01-15T10:00:00+00:00", 80.0)
+    _insert(db, "2026-01-15T10:06:00+00:00", 79.9)
+    _insert(db, "2026-01-15T10:12:00+00:00", 78.0)
+
+    now = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
+    d = daily_heartbeat(db, now, rapid_window_minutes=60, spend_slice_minutes=5)
+
+    bars = d["recent_spend"]
+    assert len(bars) == 12
+    # 10:06 drop lands in slice 1 (10:05), 10:12 drop in slice 2 (10:10).
+    assert bars[1]["spend"] == pytest.approx(0.1)
+    assert bars[2]["spend"] == pytest.approx(1.9)
+    # Empty slices (spend 0) are "under" expectation; the bigger one is "above".
+    assert bars[0]["status"] == "under"
+    assert bars[2]["status"] == "above"
+    db.close()
+
+
 def test_daily_heartbeat_detects_rapid_drop(tmp_path):
     db = BalanceDB(str(tmp_path / "r.db"))
     # Small, normal minute-level drops...

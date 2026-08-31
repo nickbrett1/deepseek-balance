@@ -39,8 +39,12 @@ raw balance trend chart. It answers three questions at a glance:
 - **Spent today & is that normal?** — today's spend compared against the median
   spend of recent complete days (`NORMAL_DAYS`, default 14), so you can tell at
   a glance whether you're on track, below average, or pacing above normal.
-- **Projected end-of-day balance** — today's spend pace extended to midnight,
-  giving an expectation of where the balance lands if the pace holds.
+- **Projected spend today** — today's spend pace extended to midnight, so you
+  know how much the day is shaping up to cost if the current pace holds.
+- **Spend per interval** — a color-coded bar chart of how much was spent in each
+  time slice of the last `RAPID_WINDOW_MINUTES`: green = under expectations,
+  blue = about right, orange = above expectations (vs. the per-slice share of
+  your typical daily spend). Bar width is `SPEND_SLICE_MINUTES`.
 - **Abnormal rapid drops?** — scans the last `RAPID_WINDOW_MINUTES` (default 60)
   for single-interval declines that are both a meaningful percentage
   (`RAPID_MIN_PCT`, default 2%) and a clear outlier relative to the recent
@@ -59,6 +63,7 @@ detection without touching code via these environment variables:
 | `RAPID_MULT`          | `2.0`   | Outlier multiple vs the recent median drop.        |
 | `MAX_GAP_MINUTES`     | `30`    | Skip comparing drops across gaps wider than this.  |
 | `NORMAL_DAYS`         | `14`    | Days of history used for the "typical day" baseline. |
+| `SPEND_SLICE_MINUTES` | `5`     | Width of each bar in the "spend last hour" chart.  |
 
 The data endpoint is `/balance/daily` (accepts an optional `now` query param
 carrying the client's local time so "today" matches the viewer's timezone).

@@ -143,6 +143,7 @@ def balance_daily(now: str | None = None) -> dict:
         rapid_mult=_float_env("RAPID_MULT", 2.0),
         max_gap_minutes=_int_env("MAX_GAP_MINUTES", 30),
         normal_days=_int_env("NORMAL_DAYS", 14),
+        spend_slice_minutes=_int_env("SPEND_SLICE_MINUTES", 5),
     )
 
 
@@ -178,8 +179,13 @@ WIDGET_HTML = """<!DOCTYPE html>
   .alert { margin-top: 6px; padding: 6px 8px; border-radius: 6px; font-size: 11px; line-height: 1.4; }
   .alert.bad { background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.3); color: #fca5a5; }
   .alert.ok { background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.25); color: #6ee7b7; }
-  .spark-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .spark-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; display: flex; justify-content: space-between; align-items: center; }
   .spark { margin-top: 2px; }
+  .legend { display: flex; gap: 10px; font-size: 9.5px; opacity: .8; font-weight: 500; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .legend .u { background: #34d399; }
+  .legend .a { background: #60a5fa; }
+  .legend .o { background: #fb923c; }
   .error { color: #f87171; padding: 8px; }
 </style>
 </head>
@@ -191,7 +197,7 @@ WIDGET_HTML = """<!DOCTYPE html>
   <div class="heart-title">Today’s heartbeat</div>
   <div id="heart">Loading…</div>
   <div class="alert" id="alert" hidden></div>
-  <div class="spark-title">Today’s balance</div>
+  <div class="spark-title"><span id="sparkTitle">Spend</span><span class="legend"><span><i class="u"></i>under</span><span><i class="a"></i>at</span><span><i class="o"></i>above</span></span></div>
   <div class="spark" id="spark"></div>
 <script>
 const DAILY = "/balance/daily";
@@ -228,7 +234,7 @@ async function load() {
     renderHeader(d);
     renderHeart(d);
     renderAlert(d);
-    renderSpark(d);
+    renderBars(d);
   } catch (e) {
     document.getElementById("heart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
   }
@@ -257,7 +263,7 @@ function renderHeart(d) {
   const rows = [
     { k: "Spent today", v: fmt(d.spent_today, d.currency) + pill },
     { k: "Typical day", v: fmt(d.normal_spend, d.currency) },
-    { k: "Projected end of day", v: fmt(d.projected_end_balance, d.currency) },
+    { k: "Projected spend today", v: fmt(d.projected_spend, d.currency) },
   ];
   document.getElementById("heart").innerHTML = rows.map((r) =>
     '<div class="row"><span class="k">' + r.k + '</span><span class="v">' + r.v + "</span></div>"
@@ -279,19 +285,32 @@ function renderAlert(d) {
   }
 }
 
-function renderSpark(d) {
-  const pts = d.today_points || [];
+function renderBars(d) {
+  const slices = d.recent_spend || [];
   const el = document.getElementById("spark");
-  if (pts.length < 2) { el.innerHTML = ""; return; }
-  const W = 320, H = 34, p = 4;
-  const vals = pts.map((q) => q.total_balance);
-  const maxV = Math.max(...vals), minV = Math.min(...vals);
-  const range = Math.max(maxV - minV, 1e-9);
-  const x = (i) => p + (pts.length === 1 ? (W - 2 * p) / 2 : (i * (W - 2 * p)) / (pts.length - 1));
-  const y = (v) => p + ((maxV - v) / range) * (H - 2 * p);
-  const line = pts.map((q, i) => x(i).toFixed(1) + "," + y(q.total_balance).toFixed(1)).join(" ");
-  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block" preserveAspectRatio="none">'
-    + '<polyline points="' + line + '" fill="none" stroke="#60a5fa" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+  document.getElementById("sparkTitle").textContent =
+    "Spend — last " + d.rapid_window_minutes + " min";
+  if (slices.length === 0) {
+    el.innerHTML = '<div class="meta">No spend data yet</div>';
+    return;
+  }
+  const W = 320, H = 64, padB = 14, gap = 2;
+  const n = slices.length;
+  const barW = (W - gap * (n - 1)) / n;
+  const maxSpend = Math.max(...slices.map((s) => s.spend || 0), 1e-9);
+  const colors = { under: "#34d399", at: "#60a5fa", above: "#fb923c" };
+  let bars = "";
+  slices.forEach((s, i) => {
+    const h = ((s.spend || 0) / maxSpend) * (H - padB - 4);
+    const x = i * (barW + gap);
+    const y = H - padB - h;
+    const c = colors[s.status] || "#334155";
+    bars += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) +
+      '" height="' + Math.max(h, 1).toFixed(1) + '" fill="' + c + '" rx="1"><title>' +
+      fmt(s.spend, d.currency) + " spent " + new Date(s.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
+      "</title></rect>";
+  });
+  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block">' + bars + "</svg>";
 }
 
 load();
