@@ -379,6 +379,14 @@ def test_mcp_today_summary_is_local(new_york_tz, tmp_path):
     # The daily view exposes a start_of_day / fraction_elapsed pair.
     assert "start_of_day" in hb
     assert "fraction_elapsed" in hb
+    # start_of_day and nested today_points timestamps must be local, not UTC.
+    assert not hb["start_of_day"].endswith("+00:00")
+    assert not hb["start_of_day"].endswith("Z")
+    for p in hb.get("today_points", []):
+        if "ts" in p:
+            assert not p["ts"].endswith("+00:00")
+    if hb.get("current_ts") is not None:
+        assert not hb["current_ts"].endswith("+00:00")
     db.close()
 
 

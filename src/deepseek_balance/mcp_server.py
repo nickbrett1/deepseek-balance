@@ -112,10 +112,13 @@ server = MCPServer(
 
 @server.tool()
 def get_balance_latest() -> dict:
-    """Return the most recent successful balance snapshot."""
+    """Return the most recent successful balance snapshot (timestamp is in the
+    server's local timezone)."""
     row = get_db().latest()
     if row is None:
         return {"error": "no successful snapshot yet"}
+    if "ts" in row:
+        row["ts"] = _to_local(row["ts"])
     return row
 
 
@@ -194,6 +197,18 @@ def today_summary(
         normal_days=normal_days,
         **_tuning(),
     )
+    # The heartbeat's nested timestamps come from DB rows as UTC; convert them
+    # to the local timezone so the agent sees the same day / hour the user does.
+    if hb.get("current_ts") is not None:
+        hb["current_ts"] = _to_local(hb["current_ts"])
+    for p in hb.get("today_points", []):
+        if "ts" in p:
+            p["ts"] = _to_local(p["ts"])
+    for d in hb.get("rapid_drops", []):
+        if "from_ts" in d:
+            d["from_ts"] = _to_local(d["from_ts"])
+        if "to_ts" in d:
+            d["to_ts"] = _to_local(d["to_ts"])
     hb["timezone"] = _tz_name()
     hb["local_now"] = _local_now().isoformat()
     return hb
