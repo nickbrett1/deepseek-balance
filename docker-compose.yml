@@ -50,7 +50,7 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "deepseek_balance.mcp_server", "--http", "--host", "0.0.0.0", "--port", "3100"]
     ports:
-      - "127.0.0.1:3100:3100"
+      - "3100:3100"
     volumes:
       - /volume1/docker/deepseek-balance:/data
     environment:
