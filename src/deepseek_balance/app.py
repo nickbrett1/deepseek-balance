@@ -294,23 +294,35 @@ function renderBars(d) {
     el.innerHTML = '<div class="meta">No spend data yet</div>';
     return;
   }
-  const W = 320, H = 64, padB = 14, gap = 2;
+  const W = 320, H = 72, padB = 13, padT = 4, gap = 2;
   const n = slices.length;
   const barW = (W - gap * (n - 1)) / n;
+  const plotH = H - padB - padT;
   const maxSpend = Math.max(...slices.map((s) => s.spend || 0), 1e-9);
   const colors = { under: "#34d399", at: "#60a5fa", above: "#fb923c" };
-  let bars = "";
+  const labelEvery = Math.max(1, Math.ceil(n / 5));
+  let bars = "", labels = "";
   slices.forEach((s, i) => {
-    const h = ((s.spend || 0) / maxSpend) * (H - padB - 4);
+    const h = ((s.spend || 0) / maxSpend) * plotH;
     const x = i * (barW + gap);
-    const y = H - padB - h;
+    const y = padT + plotH - h;
     const c = colors[s.status] || "#334155";
     bars += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) +
       '" height="' + Math.max(h, 1).toFixed(1) + '" fill="' + c + '" rx="1"><title>' +
       fmt(s.spend, d.currency) + " spent " + new Date(s.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
       "</title></rect>";
+    if (i % labelEvery === 0 || i === n - 1) {
+      labels += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (H - 3) + '" font-size="8" text-anchor="middle" opacity=".55">' +
+        new Date(s.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) + "</text>";
+    }
   });
-  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block">' + bars + "</svg>";
+  // Scale reference: a top gridline + the max value, so bar heights are legible.
+  const maxLabel = maxSpend > 1e-9
+    ? '<text x="2" y="' + (padT + 2) + '" font-size="8" fill="#94a3b8">' + fmt(maxSpend, d.currency) + "</text>"
+    : "";
+  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block">'
+    + '<line x1="0" y1="' + padT + '" x2="' + W + '" y2="' + padT + '" stroke="rgba(148,163,184,.25)" stroke-width="1"/>'
+    + bars + maxLabel + labels + "</svg>";
 }
 
 load();
