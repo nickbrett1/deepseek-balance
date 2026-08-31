@@ -177,11 +177,12 @@ def test_history_with_data(client):
     assert pts and pts[-1]["total_balance"] == 30.0
 
 
-def test_index_serves_chart(client):
+def test_index_serves_widget(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "DeepSeek Balance" in r.text
-    assert "<svg" in r.text
+    assert "Today’s heartbeat" in r.text
+    assert "spend_summary" in r.text
 
 
 # --- daily heartbeat analytics ----------------------------------------------
@@ -224,27 +225,30 @@ def test_daily_heartbeat_baseline(tmp_path):
     db.close()
 
 
-def test_daily_heartbeat_recent_spend_bars(tmp_path):
+def test_daily_heartbeat_spend_summary(tmp_path):
     db = BalanceDB(str(tmp_path / "s.db"))
     # A ¥20 "typical day" yesterday establishes the per-slice expectation.
     _insert(db, "2026-01-14T08:00:00+00:00", 100.0)
     _insert(db, "2026-01-14T20:00:00+00:00", 80.0)
-    # Today: small drop then a bigger one, both inside the recent window.
+    # Today: two spent intervals within the 24h summary window.
     _insert(db, "2026-01-15T10:00:00+00:00", 80.0)
     _insert(db, "2026-01-15T10:06:00+00:00", 79.9)
     _insert(db, "2026-01-15T10:12:00+00:00", 78.0)
 
     now = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
-    d = daily_heartbeat(db, now, rapid_window_minutes=60, spend_slice_minutes=5)
+    d = daily_heartbeat(db, now, spend_slice_minutes=5)
 
-    bars = d["recent_spend"]
-    assert len(bars) == 12
-    # 10:06 drop lands in slice 1 (10:05), 10:12 drop in slice 2 (10:10).
-    assert bars[1]["spend"] == pytest.approx(0.1)
-    assert bars[2]["spend"] == pytest.approx(1.9)
-    # Empty slices (spend 0) are "under" expectation; the bigger one is "above".
-    assert bars[0]["status"] == "under"
-    assert bars[2]["status"] == "above"
+    s = d["spend_summary"]
+    assert s["has_baseline"] is True
+    assert s["intervals_with_spend"] == 2
+    above = s["buckets"]["above"]
+    assert above["count"] == 2
+    assert above["min"] == pytest.approx(0.1)
+    assert above["max"] == pytest.approx(1.9)
+    assert above["avg"] == pytest.approx(1.0)
+    assert s["buckets"]["at"]["count"] == 0
+    assert s["buckets"]["under"]["count"] == 0
+    assert s["percent_above"] == pytest.approx(100.0)
     db.close()
 
 
@@ -291,3 +295,4 @@ def test_daily_endpoint(client):
     assert "projected_end_balance" in body
     assert "rapid_count" in body
     assert "today_points" in body
+    assert "spend_summary" in body

@@ -29,6 +29,7 @@ services:
       MAX_GAP_MINUTES: ${MAX_GAP_MINUTES:-30}
       NORMAL_DAYS: ${NORMAL_DAYS:-14}
       SPEND_SLICE_MINUTES: ${SPEND_SLICE_MINUTES:-5}
+      SPEND_SUMMARY_HOURS: ${SPEND_SUMMARY_HOURS:-24}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"

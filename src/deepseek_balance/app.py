@@ -144,6 +144,7 @@ def balance_daily(now: str | None = None) -> dict:
         max_gap_minutes=_int_env("MAX_GAP_MINUTES", 30),
         normal_days=_int_env("NORMAL_DAYS", 14),
         spend_slice_minutes=_int_env("SPEND_SLICE_MINUTES", 5),
+        summary_hours=_int_env("SPEND_SUMMARY_HOURS", 24),
     )
 
 
@@ -176,16 +177,11 @@ WIDGET_HTML = """<!DOCTYPE html>
   .pill.warn { background: rgba(251,146,60,.15); color: #fdba74; }
   .pill.bad { background: rgba(248,113,113,.18); color: #fca5a5; }
   .pill.muted { background: rgba(148,163,184,.15); color: #94a3b8; }
-  .alert { margin-top: 6px; padding: 6px 8px; border-radius: 6px; font-size: 11px; line-height: 1.4; }
-  .alert.bad { background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.3); color: #fca5a5; }
-  .alert.ok { background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.25); color: #6ee7b7; }
-  .spark-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; display: flex; justify-content: space-between; align-items: center; }
-  .spark { margin-top: 2px; }
-  .legend { display: flex; gap: 10px; font-size: 9.5px; opacity: .8; font-weight: 500; }
-  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
-  .legend .u { background: #34d399; }
-  .legend .a { background: #60a5fa; }
-  .legend .o { background: #fb923c; }
+  .summary-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .summary .row .v { font-weight: 500; }
+  .up { color: #fb923c; }
+  .at { color: #60a5fa; }
+  .dn { color: #34d399; }
   .error { color: #f87171; padding: 8px; }
 </style>
 </head>
@@ -196,9 +192,8 @@ WIDGET_HTML = """<!DOCTYPE html>
   <div class="sub" id="sub"></div>
   <div class="heart-title">Today’s heartbeat</div>
   <div id="heart">Loading…</div>
-  <div class="alert" id="alert" hidden></div>
-  <div class="spark-title"><span id="sparkTitle">Spend</span><span class="legend"><span><i class="u"></i>under</span><span><i class="a"></i>at</span><span><i class="o"></i>above</span></span></div>
-  <div class="spark" id="spark"></div>
+  <div class="summary-title" id="summaryTitle">Spend — last 24h</div>
+  <div class="summary" id="summary">Loading…</div>
 <script>
 const DAILY = "/balance/daily";
 
@@ -233,8 +228,7 @@ async function load() {
     }
     renderHeader(d);
     renderHeart(d);
-    renderAlert(d);
-    renderBars(d);
+    renderSummary(d);
   } catch (e) {
     document.getElementById("heart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
   }
@@ -270,59 +264,33 @@ function renderHeart(d) {
   ).join("");
 }
 
-function renderAlert(d) {
-  const el = document.getElementById("alert");
-  el.hidden = false;
-  if (d.rapid_count > 0) {
-    el.className = "alert bad";
-    const l = d.largest_rapid;
-    el.innerHTML = "⚠ " + d.rapid_count + (d.rapid_count === 1 ? " rapid drop" : " rapid drops") +
-      " in the last " + d.rapid_window_minutes + " min — largest " +
-      fmt(l.drop, d.currency) + " (" + (l.pct * 100).toFixed(1) + "%)";
-  } else {
-    el.className = "alert ok";
-    el.innerHTML = "✓ No abnormal drops in the last " + d.rapid_window_minutes + " min.";
-  }
-}
-
-function renderBars(d) {
-  const slices = d.recent_spend || [];
-  const el = document.getElementById("spark");
-  document.getElementById("sparkTitle").textContent =
-    "Spend — last " + d.rapid_window_minutes + " min";
-  if (slices.length === 0) {
-    el.innerHTML = '<div class="meta">No spend data yet</div>';
+function renderSummary(d) {
+  const s = d.spend_summary || {};
+  const el = document.getElementById("summary");
+  document.getElementById("summaryTitle").textContent =
+    "Spend intervals — last " + s.window_hours + "h";
+  const total = s.intervals_with_spend || 0;
+  if (total === 0) {
+    el.innerHTML = '<div class="meta">No spend in the last ' + s.window_hours + "h.</div>";
     return;
   }
-  const W = 320, H = 72, padB = 13, padT = 4, gap = 2;
-  const n = slices.length;
-  const barW = (W - gap * (n - 1)) / n;
-  const plotH = H - padB - padT;
-  const maxSpend = Math.max(...slices.map((s) => s.spend || 0), 1e-9);
-  const colors = { under: "#34d399", at: "#60a5fa", above: "#fb923c" };
-  const labelEvery = Math.max(1, Math.ceil(n / 5));
-  let bars = "", labels = "";
-  slices.forEach((s, i) => {
-    const h = ((s.spend || 0) / maxSpend) * plotH;
-    const x = i * (barW + gap);
-    const y = padT + plotH - h;
-    const c = colors[s.status] || "#334155";
-    bars += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) +
-      '" height="' + Math.max(h, 1).toFixed(1) + '" fill="' + c + '" rx="1"><title>' +
-      fmt(s.spend, d.currency) + " spent " + new Date(s.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
-      "</title></rect>";
-    if (i % labelEvery === 0 || i === n - 1) {
-      labels += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (H - 3) + '" font-size="8" text-anchor="middle" opacity=".55">' +
-        new Date(s.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) + "</text>";
+  const pct = (n) => Math.round((n / total) * 100) + "%";
+  const b = (key, cls) => {
+    const x = (s.buckets || {})[key] || {};
+    const n = x.count || 0;
+    if (n === 0) {
+      return '<div class="row"><span class="k">' + key + '</span><span class="v ' + cls + '">' + n + "</span></div>";
     }
-  });
-  // Scale reference: a top gridline + the max value, so bar heights are legible.
-  const maxLabel = maxSpend > 1e-9
-    ? '<text x="2" y="' + (padT + 2) + '" font-size="8" fill="#94a3b8">' + fmt(maxSpend, d.currency) + "</text>"
-    : "";
-  el.innerHTML = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:420px;display:block">'
-    + '<line x1="0" y1="' + padT + '" x2="' + W + '" y2="' + padT + '" stroke="rgba(148,163,184,.25)" stroke-width="1"/>'
-    + bars + maxLabel + labels + "</svg>";
+    return '<div class="row"><span class="k">' + key + '</span><span class="v ' + cls + '">' + n + " (" + pct(n) +
+      ") · avg " + fmt(x.avg, d.currency) + " · " + fmt(x.min, d.currency) + "–" + fmt(x.max, d.currency) + "</span></div>";
+  };
+  let rows = '<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>";
+  if (!s.has_baseline) {
+    el.innerHTML = rows + '<div class="meta">No baseline yet — add "typical day" spend to see over/under.</div>';
+    return;
+  }
+  rows += b("above", "up") + b("at", "at") + b("under", "dn");
+  el.innerHTML = rows;
 }
 
 load();

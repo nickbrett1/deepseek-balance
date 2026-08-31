@@ -57,6 +57,7 @@ def daily_heartbeat(
     max_gap_minutes: int = 30,
     normal_days: int = 14,
     spend_slice_minutes: int = 5,
+    summary_hours: int = 24,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -142,44 +143,84 @@ def daily_heartbeat(
     ]
     largest_rapid = max(rapid, key=lambda d: d["drop"]) if rapid else None
 
-    # --- spend per time slice in the recent window (bar chart data) ---------
+    # --- spend-interval summary over the last `summary_hours` ---------------
+    # Buckets spend into fixed slices, ignores slices with no spend, and
+    # classifies each spent interval as under / at / above the per-slice share
+    # of a typical day. This replaces the raw chart with actionable insight.
     slice_seconds = spend_slice_minutes * 60
-    window_duration = max((now_utc - window_start_utc).total_seconds(), slice_seconds)
-    n_slices = math.ceil(window_duration / slice_seconds)
+    summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
+    sum_rows = db.history(
+        summary_start_utc.isoformat(),
+        before_iso=(now_utc + timedelta(seconds=1)).isoformat(),
+    )
+    sum_drops: list[tuple[datetime, float]] = []
+    for i in range(1, len(sum_rows)):
+        prev = sum_rows[i - 1]
+        cur = sum_rows[i]
+        if prev["total_balance"] is None or cur["total_balance"] is None:
+            continue
+        gap_min = _minutes_between(prev["ts"], cur["ts"])
+        if gap_min is None or gap_min > max_gap_minutes:
+            continue
+        drop = prev["total_balance"] - cur["total_balance"]
+        if drop > 0:
+            sum_drops.append((datetime.fromisoformat(cur["ts"]), drop))
+
+    n_slices = math.ceil(
+        (now_utc - summary_start_utc).total_seconds() / slice_seconds
+    )
     spend_by_slice = [0.0] * n_slices
-    for d in drops:
-        to_ts = datetime.fromisoformat(d["to_ts"])
-        idx = math.floor((to_ts - window_start_utc).total_seconds() / slice_seconds)
+    for to_ts, drop in sum_drops:
+        idx = math.floor((to_ts - summary_start_utc).total_seconds() / slice_seconds)
         if 0 <= idx < n_slices:
-            spend_by_slice[idx] += d["drop"]
+            spend_by_slice[idx] += drop
 
     expected_per_slice = (
         (normal_spend * slice_seconds / DAY_SECONDS) if normal_spend else None
     )
-    recent_spend: list[dict] = []
-    for i in range(n_slices):
-        slice_start = window_start_utc + timedelta(seconds=i * slice_seconds)
-        spend = spend_by_slice[i]
-        expected = expected_per_slice
-        # The final slice is usually partial; scale its expectation to the
-        # fraction of that slice that has actually elapsed.
-        if expected_per_slice is not None:
-            elapsed = min((now_utc - slice_start).total_seconds(), slice_seconds)
-            expected = expected_per_slice * (elapsed / slice_seconds)
-        status = None
-        if expected:
-            ratio = spend / expected
-            status = "at" if ratio <= _AT else "above"
-            if ratio < _UNDER:
-                status = "under"
-        recent_spend.append(
-            {
-                "ts": slice_start.isoformat(),
-                "spend": spend,
-                "expected": expected,
-                "status": status,
-            }
-        )
+    buckets: dict[str, list[float]] = {"above": [], "at": [], "under": []}
+    intervals_with_spend = 0
+    for spend in spend_by_slice:
+        if spend <= 0:
+            continue
+        intervals_with_spend += 1
+        if expected_per_slice is None:
+            continue
+        ratio = spend / expected_per_slice
+        if ratio > _AT:
+            buckets["above"].append(spend)
+        elif ratio < _UNDER:
+            buckets["under"].append(spend)
+        else:
+            buckets["at"].append(spend)
+
+    def _agg(values: list[float]) -> dict:
+        return {
+            "count": len(values),
+            "min": min(values) if values else None,
+            "max": max(values) if values else None,
+            "avg": statistics.mean(values) if values else None,
+        }
+
+    above_count = len(buckets["above"])
+    spend_summary = {
+        "window_hours": summary_hours,
+        "slice_minutes": spend_slice_minutes,
+        "total_slices": n_slices,
+        "intervals_with_spend": intervals_with_spend,
+        "expected_per_slice": expected_per_slice,
+        "has_baseline": expected_per_slice is not None,
+        "buckets": {
+            "above": _agg(buckets["above"]),
+            "at": _agg(buckets["at"]),
+            "under": _agg(buckets["under"]),
+        },
+        "percent_above": (
+            (above_count / intervals_with_spend * 100)
+            if intervals_with_spend and expected_per_slice is not None
+            else None
+        ),
+    }
 
     return {
         "currency": currency,
@@ -198,6 +239,5 @@ def daily_heartbeat(
         "rapid_count": len(rapid),
         "largest_rapid": largest_rapid,
         "today_points": today_points,
-        "recent_spend": recent_spend,
-        "spend_slice_minutes": spend_slice_minutes,
+        "spend_summary": spend_summary,
     }

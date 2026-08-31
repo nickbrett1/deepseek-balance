@@ -41,29 +41,29 @@ raw balance trend chart. It answers three questions at a glance:
   a glance whether you're on track, below average, or pacing above normal.
 - **Projected spend today** — today's spend pace extended to midnight, so you
   know how much the day is shaping up to cost if the current pace holds.
-- **Spend per interval** — a color-coded bar chart of how much was spent in each
-  time slice of the last `RAPID_WINDOW_MINUTES`: green = under expectations,
-  blue = about right, orange = above expectations (vs. the per-slice share of
-  your typical daily spend). Bar width is `SPEND_SLICE_MINUTES`.
-- **Abnormal rapid drops?** — scans the last `RAPID_WINDOW_MINUTES` (default 60)
-  for single-interval declines that are both a meaningful percentage
-  (`RAPID_MIN_PCT`, default 2%) and a clear outlier relative to the recent
-  median per-interval drop (`RAPID_MULT`, default 2×). Any hits surface as a
-  red alert with the largest drop; otherwise a calm "no abnormal drops" line.
+- **Spend-interval summary** — over the last `SPEND_SUMMARY_HOURS` (default 24)
+  the widget counts how many `SPEND_SLICE_MINUTES` intervals actually had spend
+  (zero-spend intervals are ignored), then splits them into how many were
+  **above**, **at**, or **below** the per-slice share of your typical daily
+  spend. For each bucket it shows the count, the percentage of spent intervals,
+  and the range + average spend. The percentage of "above" intervals is the
+  headline signal — e.g. "5 intervals (30%) · avg ¥3.2 · ¥0.5–¥12.4".
 
-To catch rapid drops reliably the poller defaults to `POLL_INTERVAL=1m`
-(granular enough to notice a sudden single-interval decline). Tune the
-detection without touching code via these environment variables:
+The poller defaults to `POLL_INTERVAL=1m` (granular enough to notice a sudden
+single-interval decline). Tune the detection without touching code via these
+environment variables:
 
-| Env var               | Default | Meaning                                            |
-| --------------------- | ------- | -------------------------------------------------- |
-| `POLL_INTERVAL`       | `1m`    | Balance polling cadence (finer = catches faster drops). |
-| `RAPID_WINDOW_MINUTES`| `60`    | How far back to look for rapid drops.              |
-| `RAPID_MIN_PCT`       | `0.02`  | Min single-drop % to consider (as a fraction).     |
-| `RAPID_MULT`          | `2.0`   | Outlier multiple vs the recent median drop.        |
-| `MAX_GAP_MINUTES`     | `30`    | Skip comparing drops across gaps wider than this.  |
-| `NORMAL_DAYS`         | `14`    | Days of history used for the "typical day" baseline. |
-| `SPEND_SLICE_MINUTES` | `5`     | Width of each bar in the "spend last hour" chart.  |
+| Env var                | Default | Meaning                                           |
+| ---------------------- | ------- | ------------------------------------------------- |
+| `POLL_INTERVAL`        | `1m`    | Balance polling cadence (finer = catches faster drops). |
+| `MAX_GAP_MINUTES`      | `30`    | Skip comparing drops across gaps wider than this. |
+| `NORMAL_DAYS`          | `14`    | Days of history used for the "typical day" baseline. |
+| `SPEND_SLICE_MINUTES`  | `5`     | Width of each spend interval in the summary.      |
+| `SPEND_SUMMARY_HOURS`  | `24`    | How far back the spend-interval summary looks.    |
+
+> **Timezones:** the widget asks `/balance/daily` with the browser's local time
+> (including its UTC offset), so "today", the heartbeat day, and the summary
+> all align with the viewer's local day — not server UTC.
 
 The data endpoint is `/balance/daily` (accepts an optional `now` query param
 carrying the client's local time so "today" matches the viewer's timezone).
