@@ -172,31 +172,48 @@ echo "INFO: Wiring GitHub auth from Doppler into git..."
 # (push/pull, submodules, fsck). Runs when Doppler is authenticated; degrades
 # gracefully when it is not (fresh container before cloud_login.sh, or no
 # token present in the Doppler project). Which variable is used: genproj's
-# server-side GitHub auth prefers GITHUB_TOKEN; we probe GITHUB_TOKEN first,
-# then GITHUB_ACCESS_TOKEN, then GITHUB_PERSONAL_ACCESS_TOKEN (in the shared
-# common project these all resolve to the same PAT).
-GH_TOKEN_VALUE=""
-if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
-    for GH_VAR in GITHUB_TOKEN GITHUB_ACCESS_TOKEN GITHUB_PERSONAL_ACCESS_TOKEN; do
-        GH_TOKEN_VALUE="$(doppler run -- printenv "$GH_VAR" 2>/dev/null | tail -n 1)"
-        if [ -n "$GH_TOKEN_VALUE" ]; then
-            echo "INFO: Found GitHub token in Doppler variable $GH_VAR"
-            break
-        fi
-    done
+# Prefer SSH for GitHub so no token is ever embedded in git config / remotes.
+# SSH needs a key registered with your GitHub account (Settings → SSH and GPG
+# keys). When it works we rewrite https github.com remotes to git@github.com;
+# the HTTPS-token path below is only a fallback for when SSH isn't usable.
+if [ -n "$(ssh-add -L 2>/dev/null)" ] || [ -f "$HOME/.ssh/id_ed25519.pub" ] || [ -f "$HOME/.ssh/id_rsa.pub" ]; then
+    if ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com > /dev/null 2>&1; then
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        echo "INFO: GitHub auth via SSH (https github.com remotes now use git@github.com). No token embedded."
+    else
+        echo "WARN: SSH key present but GitHub rejected it - add the public key at https://github.com/settings/keys."
+    fi
+else
+    echo "INFO: No GitHub SSH key found; skipping SSH setup."
 fi
 
-if [ -n "$GH_TOKEN_VALUE" ]; then
-    # Rewrite https github.com URLs to embed the token. x-access-token is the
-    # conventional username for PAT auth over https; no separate credential
-    # helper is needed. Token stays in ~/.gitconfig (rotated/re-run by
-    # re-running this setup after cloud_login).
-    git config --global url."https://x-access-token:$GH_TOKEN_VALUE@github.com/".insteadOf "https://github.com/"
-    echo "INFO: GitHub auth wired into git (https github.com remotes now authenticate via Doppler)."
-    unset GH_TOKEN_VALUE
-else
-    echo "WARN: No GitHub token found in Doppler (tried GITHUB_TOKEN, GITHUB_ACCESS_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN)."
-    echo "      git push/pull to github.com will fall back to the VS Code credential helper / manual auth."
+# Fallback: if SSH isn't usable, embed a Doppler token. This is kept out of
+# `git remote -v`, but it does sit in plaintext in ~/.gitconfig, so prefer SSH.
+if [ -z "$(git config --global --get-regexp '^url\.git@github\.com:.*\.insteadof' 2>/dev/null)" ]; then
+    # server-side GitHub auth prefers GITHUB_TOKEN; we probe GITHUB_TOKEN first,
+    # then GITHUB_ACCESS_TOKEN, then GITHUB_PERSONAL_ACCESS_TOKEN (in the shared
+    # common project these all resolve to the same PAT).
+    GH_TOKEN_VALUE=""
+    if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
+        for GH_VAR in GITHUB_TOKEN GITHUB_ACCESS_TOKEN GITHUB_PERSONAL_ACCESS_TOKEN; do
+            GH_TOKEN_VALUE="$(doppler run -- printenv "$GH_VAR" 2>/dev/null | tail -n 1)"
+            if [ -n "$GH_TOKEN_VALUE" ]; then
+                echo "INFO: Found GitHub token in Doppler variable $GH_VAR"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$GH_TOKEN_VALUE" ]; then
+        # x-access-token is the conventional username for PAT auth over https;
+        # no separate credential helper is needed.
+        git config --global url."https://x-access-token:$GH_TOKEN_VALUE@github.com/".insteadOf "https://github.com/"
+        echo "WARN: GitHub auth fell back to an HTTPS token embedded in ~/.gitconfig. Prefer SSH."
+        unset GH_TOKEN_VALUE
+    else
+        echo "WARN: No GitHub token found in Doppler (tried GITHUB_TOKEN, GITHUB_ACCESS_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN)."
+        echo "      git push/pull to github.com will fall back to the VS Code credential helper / manual auth."
+    fi
 fi
 
 
