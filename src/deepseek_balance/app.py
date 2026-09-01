@@ -232,7 +232,7 @@ WIDGET_HTML = """<!DOCTYPE html>
   <div class="sub" id="sub"></div>
   <div class="heart-title">Today’s heartbeat</div>
   <div id="heart">Loading…</div>
-  <div class="summary-title" id="summaryTitle">Spend — last 24h</div>
+  <div class="summary-title" id="summaryTitle">Spend — today</div>
   <div class="summary" id="summary">Loading…</div>
 <script>
 const DAILY = "/balance/daily";
@@ -296,6 +296,7 @@ function renderHeart(d) {
   const pill = '<span class="pill ' + cls + '">' + label + "</span>";
   const rows = [
     { k: "Spent today", v: fmt(d.spent_today, d.currency) + pill },
+    { k: "Spend yesterday", v: fmt(d.spent_yesterday, d.currency) },
     { k: "Typical day", v: fmt(d.normal_spend, d.currency) },
     { k: "Projected spend today", v: fmt(d.projected_spend, d.currency) },
   ];
@@ -308,10 +309,10 @@ function renderSummary(d) {
   const s = d.spend_summary || {};
   const el = document.getElementById("summary");
   document.getElementById("summaryTitle").textContent =
-    "Spend — " + s.slice_minutes + " min intervals · last " + s.window_hours + "h";
+    "Spend — " + s.slice_minutes + " min intervals · today";
   const total = s.intervals_with_spend || 0;
   if (total === 0) {
-    el.innerHTML = '<div class="meta">No spend in the last ' + s.window_hours + "h.</div>";
+    el.innerHTML = '<div class="meta">No spend today.</div>';
     return;
   }
   const pct = (n) => Math.round((n / total) * 100) + "%";

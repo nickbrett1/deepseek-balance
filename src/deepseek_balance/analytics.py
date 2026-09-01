@@ -62,6 +62,7 @@ def spend_intervals(
     *,
     spend_slice_minutes: int = 5,
     summary_hours: int = 24,
+    summary_start_utc: datetime | None = None,
     spike_mult: float = SPIKE_MULT,
     spike_min_ratio: float = SPIKE_MIN_RATIO,
     min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
@@ -74,10 +75,18 @@ def spend_intervals(
     and bucket (`high` / `normal` / `below`, or `None` before enough data).
     The bucket rule uses a robust baseline (median + SPIKE_MULT * MAD) so a
     single unusually large interval is distinguished from lots of ordinary use.
+
+    The window runs for `summary_hours` ending at `now`, unless an explicit
+    `summary_start_utc` is given (e.g. the start of today) in which case it
+    spans from there to `now`.
     """
     now_utc = now.astimezone(UTC)
     slice_seconds = spend_slice_minutes * 60
-    summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
+    if summary_start_utc is None:
+        summary_start_utc = now_utc - timedelta(seconds=summary_hours * 3600)
+    else:
+        summary_start_utc = summary_start_utc.astimezone(UTC)
+    window_hours = (now_utc - summary_start_utc).total_seconds() / 3600.0
     sum_rows = db.history(
         summary_start_utc.isoformat(),
         before_iso=(now_utc + timedelta(seconds=1)).isoformat(),
@@ -148,7 +157,7 @@ def spend_intervals(
         return (n / interval_count * 100) if interval_count else None
 
     return {
-        "window_hours": summary_hours,
+        "window_hours": window_hours,
         "slice_minutes": spend_slice_minutes,
         "total_slices": n_slices,
         "enough_data": enough_data,
@@ -217,6 +226,7 @@ def daily_heartbeat(
         spent_today = max(0.0, today_rows[0]["total_balance"] - current_balance)
 
     # --- normal daily spend over recent complete days ----------------------
+    spent_yesterday = None
     day_spends: list[float] = []
     for d in range(1, normal_days + 1):
         day_start = sod_utc - timedelta(days=d)
@@ -227,7 +237,10 @@ def daily_heartbeat(
         before_rows = db.history((day_start - timedelta(days=1)).isoformat(), before_iso=day_start.isoformat())
         start_bal = before_rows[-1]["total_balance"] if before_rows else rows[0]["total_balance"]
         end_bal = rows[-1]["total_balance"]
-        day_spends.append(max(0.0, start_bal - end_bal))
+        spend = max(0.0, start_bal - end_bal)
+        if d == 1:
+            spent_yesterday = spend
+        day_spends.append(spend)
     normal_spend = _median(day_spends)
 
     # --- projection --------------------------------------------------------
@@ -281,7 +294,7 @@ def daily_heartbeat(
         db,
         now,
         spend_slice_minutes=spend_slice_minutes,
-        summary_hours=summary_hours,
+        summary_start_utc=sod_utc,
         spike_mult=spike_mult,
         spike_min_ratio=spike_min_ratio,
         min_intervals_for_baseline=min_intervals_for_baseline,
@@ -314,6 +327,7 @@ def daily_heartbeat(
         "start_of_day": sod_local.isoformat(),
         "prev_balance": prev_balance,
         "spent_today": spent_today,
+        "spent_yesterday": spent_yesterday,
         "normal_spend": normal_spend,
         "spend_vs_normal": spend_vs_normal,
         "projected_spend": projected_spend,
