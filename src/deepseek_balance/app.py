@@ -219,11 +219,179 @@ def index() -> str:
 
 @app.get("/history", response_class=HTMLResponse)
 def history_page() -> str:
-    """Back-compat alias: everything now lives on the single homepage page."""
-    return WIDGET_HTML
+    """Drill-in view: today's data plus the daily spend/usage/cost charts.
+
+    The compact homepage widget (served at `/`, iframed by the Homepage
+    dashboard) links here so the full screen only appears on drill-in."""
+    return HISTORY_HTML
 
 
 WIDGET_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Balance</title>
+<style>
+  html, body { background: #0f172a; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 12px 14px 8px; font-size: 12.5px; line-height: 1.35; color: #e2e8f0; }
+  h1 { font-size: 13px; margin: 0 0 2px; font-weight: 600; }
+  .meta { font-size: 10px; opacity: .55; margin-bottom: 4px; }
+  .balance { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .balance small { font-size: 11px; font-weight: 500; opacity: .6; }
+  .sub { font-size: 10px; opacity: .65; margin-top: 2px; }
+  .heart-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(148,163,184,.12); }
+  .row:last-child { border-bottom: 0; }
+  .row .k { opacity: .65; }
+  .row .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .pill { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 999px; margin-left: 4px; vertical-align: 1px; }
+  .pill.ok { background: rgba(52,211,153,.15); color: #6ee7b7; }
+  .pill.warn { background: rgba(251,146,60,.15); color: #fdba74; }
+  .pill.bad { background: rgba(248,113,113,.18); color: #fca5a5; }
+  .pill.muted { background: rgba(148,163,184,.15); color: #94a3b8; }
+  .summary-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  .summary .row .v { font-weight: 500; }
+  .up { color: #fb923c; }
+  .at { color: #60a5fa; }
+  .dn { color: #34d399; }
+  .error { color: #f87171; padding: 8px; }
+  .topbar { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .drill { font-size: 10px; color: #7dd3fc; text-decoration: none; white-space: nowrap; }
+  .drill:hover { text-decoration: underline; }
+  .muted-line { opacity: .55; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>DeepSeek Balance</h1>
+    <a class="drill" id="drill" href="/history" target="_blank" rel="noopener" title="Spend & usage by day">History ↗</a>
+  </div>
+  <div class="meta" id="meta">Loading…</div>
+  <div class="balance" id="balance">—</div>
+  <div class="sub" id="sub"></div>
+  <div class="heart-title">Today’s heartbeat</div>
+  <div id="heart">Loading…</div>
+  <div class="summary-title" id="summaryTitle">Spend — today</div>
+  <div class="summary" id="summary">Loading…</div>
+<script>
+const DAILY = "/balance/daily";
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+// Local ISO-8601 timestamp with offset so the server's "today" matches ours.
+function localIso() {
+  const d = new Date();
+  const off = -d.getTimezoneOffset();            // minutes east of UTC
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const tz = sign + pad(Math.floor(abs / 60)) + ":" + pad(abs % 60);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
+    "." + String(d.getMilliseconds()).padStart(3, "0") + tz;
+}
+
+function fmt(v, cur) {
+  if (v == null) return "—";
+  return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
+}
+
+// Render minutes as a compact "2h 15m" (or "45m").
+function fmtDur(min) {
+  if (min == null) return "—";
+  const m = Math.round(Number(min));
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return (h ? h + "h " : "") + mm + "m";
+}
+
+async function load() {
+  try {
+    const r = await fetch(DAILY + "?now=" + encodeURIComponent(localIso()), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (d.error || d.current_balance == null) {
+      document.getElementById("balance").textContent = "No data yet";
+      document.getElementById("heart").innerHTML = '<div class="meta">Waiting for the first snapshot…</div>';
+      return;
+    }
+    renderHeader(d);
+    renderHeart(d);
+    renderSummary(d);
+  } catch (e) {
+    document.getElementById("heart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
+  }
+}
+
+function renderHeader(d) {
+  document.getElementById("balance").innerHTML =
+    fmt(d.current_balance) + " <small>" + (d.currency || "") + "</small>";
+  document.getElementById("sub").textContent = "started the day at " + fmt(d.prev_balance, d.currency);
+  const t = new Date(d.current_ts);
+  document.getElementById("meta").textContent =
+    "Updated " + t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
+    " · " + t.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function pacing(svn) {
+  if (svn == null) return ["muted", "no baseline"];
+  if (svn < 0.7) return ["ok", "below avg"];
+  if (svn <= 1.3) return ["ok", "on track"];
+  return ["warn", "above normal"];
+}
+
+function renderHeart(d) {
+  const [cls, label] = pacing(d.spend_vs_normal);
+  const pill = '<span class="pill ' + cls + '">' + label + "</span>";
+  const rows = [
+    { k: "Spent today", v: fmt(d.spent_today, d.currency) + pill },
+    { k: "Spend yesterday", v: fmt(d.spent_yesterday, d.currency) },
+    { k: "Typical day", v: fmt(d.normal_spend, d.currency) },
+    { k: "Projected spend today", v: fmt(d.projected_spend, d.currency) },
+  ];
+  document.getElementById("heart").innerHTML = rows.map((r) =>
+    '<div class="row"><span class="k">' + r.k + '</span><span class="v">' + r.v + "</span></div>"
+  ).join("");
+}
+
+function renderSummary(d) {
+  const s = d.spend_summary || {};
+  const el = document.getElementById("summary");
+  document.getElementById("summaryTitle").textContent =
+    "Spend — " + s.slice_minutes + " min intervals · today";
+  const total = s.intervals_with_spend || 0;
+  if (total === 0) {
+    el.innerHTML = '<div class="meta">No spend today.</div>';
+    return;
+  }
+  const pct = (n) => Math.round((n / total) * 100) + "%";
+  let rows = '<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>";
+  rows += '<div class="row"><span class="k">Median interval</span><span class="v">' + fmt(s.median_interval_spend, d.currency) + "</span></div>";
+  rows += '<div class="row"><span class="k">Usage time</span><span class="v">' + fmtDur(s.usage_minutes) + "</span></div>";
+  if (!s.enough_data) {
+    const need = Math.max(0, s.min_intervals_for_baseline - total);
+    el.innerHTML = rows + '<div class="meta">Need ' + s.min_intervals_for_baseline +
+      " spent intervals to judge unusual spend — " + total + " so far" + (need ? " (" + need + " more)" : "") + ".</div>";
+    return;
+  }
+  const pctN = (n) => pct(n || 0);
+  rows += '<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
+    " (" + pctN(s.unusually_high_count) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
+  rows += '<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
+    " (" + pctN(s.normal_count) + ") · " + fmt(s.below_floor, d.currency) + "–" + fmt(s.spike_threshold, d.currency) + "</span></div>";
+  rows += '<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
+    " (" + pctN(s.below_count) + ") · under " + fmt(s.below_floor, d.currency) + "</span></div>";
+  el.innerHTML = rows;
+}
+
+load();
+</script>
+</body>
+</html>
+"""
+
+
+HISTORY_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">

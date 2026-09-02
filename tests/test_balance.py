@@ -187,6 +187,20 @@ def test_index_serves_widget(client):
     assert "spend_summary" in r.text
 
 
+def test_index_is_compact_and_history_is_the_drill_in(client):
+    """Homepage widget shows only today; the charts live on the /history page."""
+    root = client.get("/").text
+    drill = client.get("/history").text
+    # The iframed homepage widget must stay compact — no day charts here.
+    assert "Cost per hour" not in root
+    assert "Spend per day" not in root
+    assert "Today’s heartbeat" in root
+    # Drill-in carries the daily charts.
+    assert "Cost per hour" in drill
+    assert "Spend per day" in drill
+    assert "Usage time per day" in drill
+
+
 # --- daily heartbeat analytics ----------------------------------------------
 
 def _insert(db, ts, bal, granted=1.0, topped=0.0):

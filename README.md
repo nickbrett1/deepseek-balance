@@ -85,10 +85,12 @@ The **Spend — today** summary also reports **Usage time** — a rough proxy fo
 how long the API was actively worked, defined as the number of spend intervals
 with spend × the interval width (e.g. `SPEND_SLICE_MINUTES`).
 
-Everything now lives on the **single homepage page** (`/`; `/history` is a
-back-compat alias). Under today's heartbeat and interval summary, three
-separate charts show the previous days (each range has its own scale, so no
-dual-axis juggling):
+The homepage widget (`/`) stays a **compact today-only panel** (it is iframed
+by the Homepage dashboard). Its **History ↗** link opens the full drill-in at
+`/history`, which pairs today's heartbeat & interval summary with the daily
+charts below (no horizontal scroll, so it works on a phone). Three separate
+charts show the previous days (each range has its own scale, so no dual-axis
+juggling):
 
 1. **Spend per day** — total spend per complete day.
 2. **Usage time per day** — minutes of active use (spent slices × width).
