@@ -166,54 +166,38 @@ echo "INFO: Configuring git safe directory..."
 git config --global --add safe.directory /workspaces/deepseek-balance
 
 
-echo "INFO: Wiring GitHub auth from Doppler into git..."
-# genproj-github-auth: fetch a GitHub PAT from the repo's Doppler project and
-# configure git so https github.com remotes authenticate automatically
-# (push/pull, submodules, fsck). Runs when Doppler is authenticated; degrades
-# gracefully when it is not (fresh container before cloud_login.sh, or no
-# token present in the Doppler project). Which variable is used: genproj's
-# Prefer SSH for GitHub so no token is ever embedded in git config / remotes.
-# SSH needs a key registered with your GitHub account (Settings → SSH and GPG
-# keys). When it works we rewrite https github.com remotes to git@github.com;
-# the HTTPS-token path below is only a fallback for when SSH isn't usable.
-if [ -n "$(ssh-add -L 2>/dev/null)" ] || [ -f "$HOME/.ssh/id_ed25519.pub" ] || [ -f "$HOME/.ssh/id_rsa.pub" ]; then
-    if ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com > /dev/null 2>&1; then
-        git config --global url."git@github.com:".insteadOf "https://github.com/"
-        echo "INFO: GitHub auth via SSH (https github.com remotes now use git@github.com). No token embedded."
-    else
-        echo "WARN: SSH key present but GitHub rejected it - add the public key at https://github.com/settings/keys."
-    fi
+echo "INFO: Configuring GitHub auth over SSH (no PAT)..."
+# genproj-github-auth (SSH-first): GitHub remotes authenticate via an SSH key
+# supplied by the host bind-mount (~/.ssh) or the forwarded SSH agent. No PAT
+# is ever written to ~/.gitconfig or remote URLs.
+KEY_COPIED=""
+if [ -n "${SSH_AUTH_SOCK:-}" ] && command -v ssh-add &> /dev/null && ssh-add -l >/dev/null 2>&1; then
+    echo "INFO: GitHub auth via forwarded SSH agent (${SSH_AUTH_SOCK})."
 else
-    echo "INFO: No GitHub SSH key found; skipping SSH setup."
+    mkdir -p "$HOME/.genproj-ssh" && chmod 700 "$HOME/.genproj-ssh"
+    for KEY in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+        if [ -r "$KEY" ]; then
+            DEST="$HOME/.genproj-ssh/$(basename "$KEY")"
+            cp "$KEY" "$DEST"
+            chmod 600 "$DEST"
+            KEY_COPIED="$DEST"
+            echo "INFO: Copied host-mounted key $KEY into $DEST."
+            break
+        fi
+    done
 fi
-
-# Fallback: if SSH isn't usable, embed a Doppler token. This is kept out of
-# `git remote -v`, but it does sit in plaintext in ~/.gitconfig, so prefer SSH.
-if [ -z "$(git config --global --get-regexp '^url\.git@github\.com:.*\.insteadof' 2>/dev/null)" ]; then
-    # server-side GitHub auth prefers GITHUB_TOKEN; we probe GITHUB_TOKEN first,
-    # then GITHUB_ACCESS_TOKEN, then GITHUB_PERSONAL_ACCESS_TOKEN (in the shared
-    # common project these all resolve to the same PAT).
-    GH_TOKEN_VALUE=""
-    if command -v doppler &> /dev/null && doppler whoami &> /dev/null 2>&1; then
-        for GH_VAR in GITHUB_TOKEN GITHUB_ACCESS_TOKEN GITHUB_PERSONAL_ACCESS_TOKEN; do
-            GH_TOKEN_VALUE="$(doppler run -- printenv "$GH_VAR" 2>/dev/null | tail -n 1)"
-            if [ -n "$GH_TOKEN_VALUE" ]; then
-                echo "INFO: Found GitHub token in Doppler variable $GH_VAR"
-                break
-            fi
-        done
-    fi
-
-    if [ -n "$GH_TOKEN_VALUE" ]; then
-        # x-access-token is the conventional username for PAT auth over https;
-        # no separate credential helper is needed.
-        git config --global url."https://x-access-token:$GH_TOKEN_VALUE@github.com/".insteadOf "https://github.com/"
-        echo "WARN: GitHub auth fell back to an HTTPS token embedded in ~/.gitconfig. Prefer SSH."
-        unset GH_TOKEN_VALUE
-    else
-        echo "WARN: No GitHub token found in Doppler (tried GITHUB_TOKEN, GITHUB_ACCESS_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN)."
-        echo "      git push/pull to github.com will fall back to the VS Code credential helper / manual auth."
-    fi
+if [ -n "$KEY_COPIED" ]; then
+    git config --global core.sshCommand "ssh -i $KEY_COPIED -o IdentitiesOnly=yes"
+fi
+if git config --global --get-regexp '^url\.git@github\.com:.*\.insteadof' >/dev/null 2>&1; then
+    echo "INFO: GitHub SSH rewrite already configured; leaving in place."
+elif ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -T git@github.com 2>&1 | grep -qi "successfully authenticated"; then
+    git config --global url."git@github.com:".insteadOf "https://github.com/"
+    echo "INFO: GitHub remotes now use SSH (git@github.com:)."
+else
+    echo "WARN: No working SSH key/agent found for github.com."
+    echo "      Add an SSH public key at https://github.com/settings/keys,"
+    echo "      load it on the host (ssh-add --apple-use-keychain), and rebuild."
 fi
 
 

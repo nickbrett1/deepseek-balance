@@ -31,7 +31,8 @@
   "mounts": [
     "source=deepseek-balance-tailscale-state,target=/var/lib/tailscale,type=volume",
     "source=${localEnv:HOME}/.doppler,target=/home/vscode/.doppler,type=bind",
-    "source=${localEnv:HOME}/.config/goose,target=/home/vscode/.config/goose,type=bind"
+    "source=${localEnv:HOME}/.config/goose,target=/home/vscode/.config/goose,type=bind",
+    "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind"
   ],
   "forwardPorts": [],
   "containerEnv": {
