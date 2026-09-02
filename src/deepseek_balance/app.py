@@ -70,6 +70,7 @@ def _summary_kwargs() -> dict:
         "min_intervals_for_baseline": _int_env("MIN_INTERVALS_FOR_BASELINE", 10),
         "normal_band": _float_env("NORMAL_BAND", 2.0),
         "max_gap_minutes": _int_env("MAX_GAP_MINUTES", 30),
+        "baseline_days": _int_env("BASELINE_DAYS", 14),
     }
 
 
@@ -165,6 +166,29 @@ def balance_daily(now: str | None = None) -> dict:
     )
 
 
+@app.get("/balance/days")
+def balance_days(now: str | None = None, days: int = 14) -> dict:
+    """Per-complete-day spend & usage-time series (bars for the history view).
+
+    `days` is the number of most-recent complete days to return; pass `0` for
+    all data from the earliest snapshot. Today is excluded (it's partial) and
+    `now` carries the client's local time so day boundaries match the viewer.
+    """
+    tz_now = _parse_now(now)
+    kwargs = {
+        "spend_slice_minutes": _int_env("SPEND_SLICE_MINUTES", 5),
+        "max_gap_minutes": _int_env("MAX_GAP_MINUTES", 30),
+    }
+    series = analytics.daily_history_series(
+        app.state.db, tz_now, days=(days if days > 0 else None), **kwargs
+    )
+    # Currency for display; also carry the daily heartbeat so a single drill-in
+    # page can render both today's card and the historical bars from one fetch.
+    latest = app.state.db.latest()
+    series["currency"] = latest["currency"] if latest else None
+    return series
+
+
 @app.get("/spend/intervals")
 def spend_intervals_endpoint(
     now: str | None = None,
@@ -191,6 +215,11 @@ def spend_intervals_endpoint(
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return WIDGET_HTML
+
+
+@app.get("/history", response_class=HTMLResponse)
+def history_page() -> str:
+    return HISTORY_HTML
 
 
 WIDGET_HTML = """<!DOCTYPE html>
@@ -223,10 +252,17 @@ WIDGET_HTML = """<!DOCTYPE html>
   .at { color: #60a5fa; }
   .dn { color: #34d399; }
   .error { color: #f87171; padding: 8px; }
+  .topbar { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .drill { font-size: 10px; color: #7dd3fc; text-decoration: none; white-space: nowrap; }
+  .drill:hover { text-decoration: underline; }
+  .muted-line { opacity: .55; }
 </style>
 </head>
 <body>
-  <h1>DeepSeek Balance</h1>
+  <div class="topbar">
+    <h1>DeepSeek Balance</h1>
+    <a class="drill" id="drill" href="/history" target="_blank" rel="noopener" title="Spend & usage by day">History ↗</a>
+  </div>
   <div class="meta" id="meta">Loading…</div>
   <div class="balance" id="balance">—</div>
   <div class="sub" id="sub"></div>
@@ -254,6 +290,15 @@ function localIso() {
 function fmt(v, cur) {
   if (v == null) return "—";
   return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
+}
+
+// Render minutes as a compact "2h 15m" (or "45m").
+function fmtDur(min) {
+  if (min == null) return "—";
+  const m = Math.round(Number(min));
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return (h ? h + "h " : "") + mm + "m";
 }
 
 async function load() {
@@ -318,6 +363,7 @@ function renderSummary(d) {
   const pct = (n) => Math.round((n / total) * 100) + "%";
   let rows = '<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>";
   rows += '<div class="row"><span class="k">Median interval</span><span class="v">' + fmt(s.median_interval_spend, d.currency) + "</span></div>";
+  rows += '<div class="row"><span class="k">Usage time</span><span class="v">' + fmtDur(s.usage_minutes) + "</span></div>";
   if (!s.enough_data) {
     const need = Math.max(0, s.min_intervals_for_baseline - total);
     el.innerHTML = rows + '<div class="meta">Need ' + s.min_intervals_for_baseline +
@@ -335,6 +381,233 @@ function renderSummary(d) {
 }
 
 load();
+</script>
+</body>
+</html>
+"""
+
+HISTORY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Balance · History</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { background: #0f172a; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 18px 20px 30px; font-size: 13px; line-height: 1.4; color: #e2e8f0; }
+  a { color: #7dd3fc; }
+  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  .back { font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 12px 0; }
+  .card { background: rgba(30,41,59,.55); border: 1px solid rgba(148,163,184,.14); border-radius: 8px; padding: 10px 12px; }
+  .card .t { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
+  .card .v { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .card .s { font-size: 11px; opacity: .7; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .seg { display: inline-flex; border: 1px solid rgba(148,163,184,.25); border-radius: 6px; overflow: hidden; margin: 10px 0 4px; }
+  .seg button { background: transparent; color: #cbd5e1; border: 0; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .seg button.on { background: #334155; color: #f1f5f9; }
+  .legend { font-size: 11px; opacity: .75; margin-bottom: 4px; }
+  .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 5px 0 12px; vertical-align: -1px; }
+  .chartwrap { overflow-x: auto; border: 1px solid rgba(148,163,184,.14); border-radius: 8px; background: rgba(15,23,42,.4); padding: 10px; }
+  .muted { opacity: .55; }
+  .err { color: #f87171; }
+  svg text { font-family: ui-sans-serif, system-ui, sans-serif; }
+</style>
+</head>
+<body>
+  <div class="back"><a href="/">&larr; back to today</a></div>
+  <h1>DeepSeek Balance · by day</h1>
+  <div class="muted" id="sub">Loading…</div>
+
+  <div class="seg" id="range">
+    <button data-days="14" class="on">14 days</button>
+    <button data-days="30">Last month</button>
+    <button data-days="0">All time</button>
+  </div>
+
+  <div class="grid" id="cards">
+    <div class="card"><div class="t">Spent today</div><div class="v" id="cSpent">—</div><div class="s" id="sSpent">usage 0m · —/min</div></div>
+    <div class="card"><div class="t">Balance now</div><div class="v" id="cBal">—</div><div class="s" id="sBal"></div></div>
+    <div class="card"><div class="t">Range spend</div><div class="v" id="cTotal">—</div><div class="s" id="sTotal"></div></div>
+    <div class="card"><div class="t">Range usage</div><div class="v" id="cUse">—</div><div class="s" id="sUse"></div></div>
+    <div class="card"><div class="t">Overall cost / min</div><div class="v" id="cCpm">—</div><div class="s" id="sCpm">usage-weighted avg</div></div>
+  </div>
+
+  <div class="legend">
+    <span class="sw" style="background:#38bdf8"></span>spend (<span id="legCur">currency</span>, left axis)
+    <span class="sw" style="background:#a78bfa"></span>usage time (right axis)
+  </div>
+  <div class="chartwrap" id="chartwrap"><div class="muted" id="chartMsg">Loading…</div></div>
+
+<script>
+const DAILY = "/balance/daily";
+const DAYS = "/balance/days";
+const RANGES = { "14": 14, "30": 30, "0": 0 };
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function localIso() {
+  const d = new Date();
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const tz = sign + pad(Math.floor(abs / 60)) + ":" + pad(abs % 60);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
+    "." + String(d.getMilliseconds()).padStart(3, "0") + tz;
+}
+function fmt(v, cur) {
+  if (v == null) return "—";
+  return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
+}
+function fmtDur(min) {
+  if (min == null) return "—";
+  const m = Math.round(Number(min));
+  const h = Math.floor(m / 60), mm = m % 60;
+  return (h ? h + "h " : "") + mm + "m";
+}
+function fmtMoney(v, cur) {
+  if (v == null) return "—";
+  const s = v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return s + (cur ? " " + cur : "");
+}
+function fmtCpm(v, cur) {
+  if (v == null) return "—";
+  const per = v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toExponential(1);
+  return per + (cur ? " " + cur : "") + "/min";
+}
+function fmtRight(min) {
+  const m = Math.round(Number(min));
+  if (m >= 60) { const h = m / 60; return (h % 1 === 0 ? h : h.toFixed(1)) + "h"; }
+  return m + "m";
+}
+function niceStep(raw) {
+  if (!(raw > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  let s;
+  if (norm <= 1) s = 1; else if (norm <= 2) s = 2; else if (norm <= 2.5) s = 2.5;
+  else if (norm <= 5) s = 5; else s = 10;
+  return s * mag;
+}
+
+let cur = "";
+const state = { days: 14 };
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function loadCards() {
+  const d = await getJSON(DAILY + "?now=" + encodeURIComponent(localIso()));
+  if (d.error || d.current_balance == null) { document.getElementById("sSpent").textContent = "waiting for first snapshot"; return; }
+  cur = d.currency || "";
+  document.getElementById("legCur").textContent = cur || "currency";
+  const ss = d.spend_summary || {};
+  const useMin = ss.usage_minutes || 0;
+  const cpm = d.spent_today != null && useMin > 0 ? d.spent_today / useMin : null;
+  document.getElementById("cSpent").textContent = fmt(d.spent_today, cur);
+  document.getElementById("sSpent").textContent = "usage " + fmtDur(useMin) + " · " + fmtCpm(cpm, cur);
+  document.getElementById("cBal").textContent = fmt(d.current_balance, cur);
+  const t = new Date(d.current_ts);
+  document.getElementById("sBal").textContent = "updated " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+    " · projected " + fmt(d.projected_spend, cur) + " today";
+  document.getElementById("sub").textContent =
+    "Today's numbers (left cards) refresh live; bars are complete days up to yesterday.";
+}
+
+function svgText(x, y, str, anchor, fill, size) {
+  return '<text x="' + x + '" y="' + y + '" text-anchor="' + (anchor || "middle") + '" fill="' + (fill || "#94a3b8") + '" font-size="' + (size || 10) + '">' + str + "</text>";
+}
+
+function renderChart(data) {
+  const box = document.getElementById("chartwrap");
+  const days = (data && data.days) || [];
+  if (!days.length) {
+    box.innerHTML = '<div class="muted">No complete days of data yet — check back after your first full day.</div>';
+    return;
+  }
+  const spendMax = Math.max.apply(null, days.map(d => d.spend)) || 1;
+  const useMax = Math.max.apply(null, days.map(d => d.usage_minutes)) || 1;
+  const stepL = niceStep(spendMax / 4), topL = Math.ceil(spendMax / stepL) * stepL;
+  const stepR = niceStep(useMax / 4), topR = Math.ceil(useMax / stepR) * stepR;
+
+  const n = days.length;
+  const padL = 46, padR = 46, padT = 8, padB = 26;
+  const slot = n <= 14 ? 42 : n <= 31 ? 30 : Math.max(14, Math.min(22, 2400 / n));
+  const width = n * slot + padL + padR;
+  const plotH = 220, height = plotH + padT + padB;
+  const plotW = width - padL - padR;
+  const barW = Math.min(slot * 0.36, 34);
+  const y = (frac) => padT + plotH * (1 - frac);
+
+  let s = '<svg viewBox="0 0 ' + width + ' ' + height + '" width="100%" style="min-width:' + width + 'px">';
+  const steps = 4;
+  for (let k = 0; k <= steps; k++) {
+    const f = k / steps;
+    const gy = y(f);
+    s += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (width - padR) + '" y2="' + gy + '" stroke="rgba(148,163,184,.12)"' + (k === 0 ? ' stroke-width="1.2"' : "") + "/>";
+    const leftV = topL * f;
+    s += svgText(padL - 6, gy + 3, leftV.toLocaleString(undefined, { maximumFractionDigits: 0 }), "end", "#94a3b8");
+    const rightV = topR * f;
+    s += svgText(width - padR + 6, gy + 3, fmtRight(rightV), "start", "#a78bfa");
+  }
+
+  const labelEvery = Math.max(1, Math.ceil(n / 14));
+  for (let i = 0; i < n; i++) {
+    const d = days[i];
+    const cx = padL + i * slot + slot / 2;
+    const sf = d.spend / topL, uf = d.usage_minutes / topR;
+    const hS = sf * plotH, hU = uf * plotH;
+    const xS = cx - barW - 1.5, xU = cx + 1.5;
+    s += '<rect x="' + xS.toFixed(1) + '" y="' + y(sf).toFixed(1) + '" width="' + barW + '" height="' + hS.toFixed(1) + '" fill="#38bdf8" rx="1"><title>' +
+      d.date + " spend " + fmtMoney(d.spend, cur) + (d.cost_per_minute != null ? " · " + fmtCpm(d.cost_per_minute, cur) : "") + "</title></rect>";
+    s += '<rect x="' + xU.toFixed(1) + '" y="' + y(uf).toFixed(1) + '" width="' + barW + '" height="' + hU.toFixed(1) + '" fill="#a78bfa" rx="1" opacity="0.85"><title>' +
+      d.date + " usage " + fmtDur(d.usage_minutes) + "</title></rect>";
+    if (i % labelEvery === 0) {
+      s += svgText(cx, height - 8, d.date.slice(5));
+    }
+  }
+  s += "</svg>";
+  box.innerHTML = s;
+
+  const totSpend = days.reduce((a, d) => a + d.spend, 0);
+  const totUse = days.reduce((a, d) => a + d.usage_minutes, 0);
+  const daysWithUse = days.filter(d => d.usage_minutes > 0);
+  const wCpm = totUse > 0 ? totSpend / totUse : null;
+  const wCpmPerDay = wCpm != null && daysWithUse.length
+    ? daysWithUse.reduce((a, d) => a + d.cost_per_minute, 0) / daysWithUse.length : null;
+  const label = state.days === 0 ? "since " + days[0].date : "last " + days.length + " complete days";
+  document.getElementById("cTotal").textContent = fmtMoney(totSpend, cur);
+  document.getElementById("sTotal").textContent = label;
+  document.getElementById("cUse").textContent = fmtDur(totUse);
+  document.getElementById("sUse").textContent = "≈ " + (totUse / 60).toFixed(1) + "h active across " + days.length + " days";
+  document.getElementById("cCpm").textContent = fmtCpm(wCpm, cur);
+  document.getElementById("sCpm").textContent = "avg day " + fmtCpm(wCpmPerDay, cur) + " · hover bars for daily";
+}
+
+async function loadChart() {
+  try {
+    const data = await getJSON(DAYS + "?days=" + state.days + "&now=" + encodeURIComponent(localIso()));
+    renderChart(data);
+  } catch (e) {
+    document.getElementById("chartwrap").innerHTML = '<div class="err">Failed to load history: ' + e.message + "</div>";
+  }
+}
+
+document.getElementById("range").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  state.days = RANGES[btn.dataset.days];
+  document.querySelectorAll("#range button").forEach(b => b.classList.remove("on"));
+  btn.classList.add("on");
+  loadChart();
+});
+
+loadCards().catch(e => { document.getElementById("sSpent").textContent = "failed to load: " + e.message; });
+loadChart();
 </script>
 </body>
 </html>

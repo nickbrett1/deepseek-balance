@@ -245,6 +245,73 @@ def test_daily_heartbeat_spend_summary_needs_data(tmp_path):
     db.close()
 
 
+def test_daily_heartbeat_spend_summary_warmup_from_prior_days(tmp_path):
+    """Early in the day, prior days' intervals warm the baseline so a fresh
+    spike is still flagged even when today alone has too few spent intervals."""
+    db = BalanceDB(str(tmp_path / "w.db"))
+    # Prior day: a steady stream of ¥1 intervals (12 spent intervals, median 1).
+    t = datetime(2026, 1, 14, 1, 0, tzinfo=UTC)
+    bal = 100.0
+    _insert(db, t.isoformat(), bal)
+    for _ in range(12):
+        t += timedelta(minutes=5)
+        bal -= 1.0
+        _insert(db, t.isoformat(), bal)
+    # This morning: just two spent intervals, one a clear spike.
+    now = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+    _insert(db, "2026-01-15T06:00:00+00:00", 50.0)
+    _insert(db, "2026-01-15T06:05:00+00:00", 49.0)   # normal ¥1
+    _insert(db, "2026-01-15T06:10:00+00:00", 41.0)   # ¥8 spike
+
+    s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
+
+    # Today is still sparse, but the prior-day baseline lets us classify.
+    assert s["intervals_with_spend"] == 2
+    assert s["enough_data"] is True
+    assert s["baseline_source"] == "history"
+    assert s["median_interval_spend"] == pytest.approx(1.0)
+    assert s["spike_threshold"] == pytest.approx(2.0)
+    assert s["unusually_high_count"] == 1
+    assert s["normal_count"] == 1
+    db.close()
+
+
+def test_daily_heartbeat_history_baseline_preferred_over_today(tmp_path):
+    """Even once today has enough intervals, the larger history baseline wins."""
+    db = BalanceDB(str(tmp_path / "hp.db"))
+    # Prior day: steady ¥1 intervals.
+    t = datetime(2026, 1, 14, 1, 0, tzinfo=UTC)
+    bal = 100.0
+    _insert(db, t.isoformat(), bal)
+    for _ in range(12):
+        t += timedelta(minutes=5)
+        bal -= 1.0
+        _insert(db, t.isoformat(), bal)
+    # Today: a full day of ¥0.1 intervals plus a ¥0.5 "spike" relative to today.
+    # Today's own median would be ~0.1, but history (median 1.0) must win, so
+    # nothing today is high.
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    t2 = datetime(2026, 1, 15, 6, 0, tzinfo=UTC)
+    bal2 = 100.0
+    _insert(db, t2.isoformat(), bal2)
+    for _ in range(12):
+        t2 += timedelta(minutes=5)
+        bal2 -= 0.1
+        _insert(db, t2.isoformat(), bal2)
+    t2 += timedelta(minutes=5)
+    bal2 -= 0.5
+    _insert(db, t2.isoformat(), bal2)
+
+    s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
+
+    assert s["intervals_with_spend"] == 13
+    assert s["enough_data"] is True
+    assert s["baseline_source"] == "history"
+    assert s["median_interval_spend"] == pytest.approx(1.0)
+    assert s["unusually_high_count"] == 0
+    db.close()
+
+
 def test_daily_heartbeat_spend_summary_flags_spike(tmp_path):
     db = BalanceDB(str(tmp_path / "sp.db"))
     # 6 ¥1 intervals (normal), 3 ¥0.2 intervals (below) and one ¥7 spike.
@@ -321,6 +388,85 @@ def test_spend_intervals_endpoint(client):
     high = r2.json()["intervals"]
     assert len(high) == 1
     assert all(i["bucket"] == "high" for i in high)
+
+
+def _seed_dense_day(db, day: datetime, *, start_bal: float, drops: list[float]):
+    """Seed a day with 5-min-apart snapshots so declines register as spent slices."""
+    t = day
+    bal = start_bal
+    _insert(db, t.isoformat(), bal)
+    for d in drops:
+        t += timedelta(minutes=5)
+        bal -= d
+        _insert(db, t.isoformat(), bal)
+
+
+def test_daily_history_series_usage_and_cost_per_minute(tmp_path):
+    from deepseek_balance.analytics import daily_history_series
+
+    db = BalanceDB(str(tmp_path / "h.db"))
+    # Two prior complete days; each day 3 spent 5-min slices of ¥2 → spend 6,
+    # usage 15m → cost/min 0.4. Balance reset each day for a clean drop series.
+    _seed_dense_day(db, datetime(2026, 1, 13, 1, 0, tzinfo=UTC), start_bal=100.0, drops=[2.0] * 3)
+    _seed_dense_day(db, datetime(2026, 1, 14, 1, 0, tzinfo=UTC), start_bal=94.0, drops=[2.0] * 3)
+
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)  # today excluded
+    series = daily_history_series(db, now, days=2, spend_slice_minutes=5)
+
+    assert series["end_date"] == "2026-01-14"
+    assert len(series["days"]) == 2
+    d13, d14 = series["days"]
+    for day in (d13, d14):
+        assert day["spend"] == pytest.approx(6.0)
+        assert day["usage_minutes"] == 15
+        assert day["intervals_with_spend"] == 3
+        assert day["cost_per_minute"] == pytest.approx(0.4)
+    db.close()
+
+
+def test_daily_history_series_all_time_from_earliest(tmp_path):
+    from deepseek_balance.analytics import daily_history_series
+
+    db = BalanceDB(str(tmp_path / "a.db"))
+    _seed_dense_day(db, datetime(2026, 1, 10, 1, 0, tzinfo=UTC), start_bal=100.0, drops=[1.0])
+    _seed_dense_day(db, datetime(2026, 1, 14, 1, 0, tzinfo=UTC), start_bal=99.0, drops=[2.0, 2.0])
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    series = daily_history_series(db, now, days=None, spend_slice_minutes=5)
+    # Covers everything from the earliest snapshot's day up to yesterday.
+    assert series["start_date"] == "2026-01-10"
+    assert series["end_date"] == "2026-01-14"
+    assert len(series["days"]) == 5
+    assert series["days"][0]["spend"] == pytest.approx(1.0)
+    assert series["days"][-1]["spend"] == pytest.approx(4.0)
+    db.close()
+
+
+def test_daily_heartbeat_usage_minutes(tmp_path):
+    db = BalanceDB(str(tmp_path / "u.db"))
+    _seed_dense_day(db, datetime(2026, 1, 15, 0, 30, tzinfo=UTC), start_bal=100.0, drops=[1.0] * 3)
+    now = datetime(2026, 1, 15, 1, 0, tzinfo=UTC)
+    s = daily_heartbeat(db, now, spend_slice_minutes=5)["spend_summary"]
+    assert s["intervals_with_spend"] == 3
+    assert s["usage_minutes"] == 15  # 3 slices × 5 min
+    db.close()
+
+
+def test_days_endpoint(client):
+    db = client.app.state.db
+    # Seed two prior complete days, dense enough to register slices.
+    today_local = datetime.now(UTC)
+    _seed_dense_day(db, today_local - timedelta(days=2), start_bal=100.0, drops=[2.0] * 3)
+    _seed_dense_day(db, today_local - timedelta(days=1), start_bal=94.0, drops=[2.0] * 3)
+    r = client.get("/balance/days?days=3")
+    assert r.status_code == 200
+    body = r.json()
+    assert "currency" in body
+    # days=3 covers 3 complete days (today excluded); one seeded day may be empty.
+    assert len(body["days"]) == 3
+    assert all("usage_minutes" in d and "cost_per_minute" in d for d in body["days"])
+    assert body["days"][-1]["usage_minutes"] == 15
+    # Today's date must never appear in the series (partial day excluded).
+    assert body["days"][-1]["date"] != datetime.now(UTC).date().isoformat()
 
 
 def test_daily_endpoint(client):

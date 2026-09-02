@@ -63,6 +63,7 @@ def _tuning() -> dict:
         "min_intervals_for_baseline": _int("MIN_INTERVALS_FOR_BASELINE", 10),
         "normal_band": _float("NORMAL_BAND", 2.0),
         "max_gap_minutes": _int("MAX_GAP_MINUTES", 30),
+        "baseline_days": _int("BASELINE_DAYS", 14),
     }
 
 

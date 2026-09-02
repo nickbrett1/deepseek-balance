@@ -79,6 +79,24 @@ environment variables:
 The data endpoint is `/balance/daily` (accepts an optional `now` query param
 carrying the client's local time so "today" matches the viewer's timezone).
 
+### Usage time & the History drill-in (`/history`)
+
+The **Spend — today** summary also reports **Usage time** — a rough proxy for
+how long the API was actively worked, defined as the number of spend intervals
+with spend × the interval width (e.g. `SPEND_SLICE_MINUTES`). A "History ↗"
+link on the homepage opens the drill-in view at `/history`, which pairs the
+live today's numbers with a grouped bar chart of **previous complete days**
+(today is partial and deliberately excluded). Each day shows two bars: total
+**spend** (left axis) and **usage time** (right axis), so you can eyeball both
+cost and the time that bought it. A range toggle switches between the last
+**14 days** (default), **last month**, and **all time** (from the earliest
+snapshot). Every bar's tooltip also shows that day's **cost-per-minute**
+(spend ÷ usage minutes), and the page's cards total spend, usage and the
+usage-weighted overall cost/min across the visible range.
+
+The data endpoint is `/balance/days` (`days` = number of complete days, or `0`
+for all time; `now` optional for local day alignment).
+
 ## Analysis API & MCP
 
 The per-interval classification is exposed two ways so you can dig into *why*

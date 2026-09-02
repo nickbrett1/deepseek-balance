@@ -80,6 +80,18 @@ class BalanceDB:
             )
             self._conn.commit()
 
+    def earliest_ts(self) -> str | None:
+        """Timestamp of the earliest snapshot that carries a balance."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT ts FROM balance_snapshots
+                WHERE total_balance IS NOT NULL
+                ORDER BY ts ASC LIMIT 1
+                """
+            ).fetchone()
+        return row["ts"] if row else None
+
     def latest(self) -> dict | None:
         """Latest successful snapshot (available and HTTP 200)."""
         with self._lock:

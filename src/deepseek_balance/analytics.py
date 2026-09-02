@@ -56,6 +56,187 @@ def _minutes_between(a: str, b: str) -> float | None:
         return None
 
 
+def _collect_drops(rows: list[dict], max_gap_minutes: int) -> list[tuple[datetime, float]]:
+    """Per-interval balance declines from a chronological row list.
+
+    Each decline is attributed to the timestamp of the snapshot it ended in
+    and only counts when the gap between snapshots is sane (<= max_gap_minutes)
+    so that downtime gaps don't masquerade as a single big spend.
+    """
+    drops: list[tuple[datetime, float]] = []
+    for i in range(1, len(rows)):
+        prev = rows[i - 1]
+        cur = rows[i]
+        if prev["total_balance"] is None or cur["total_balance"] is None:
+            continue
+        gap_min = _minutes_between(prev["ts"], cur["ts"])
+        if gap_min is None or gap_min > max_gap_minutes:
+            continue
+        drop = prev["total_balance"] - cur["total_balance"]
+        if drop > 0:
+            drops.append((datetime.fromisoformat(cur["ts"]), drop))
+    return drops
+
+
+def _pool_interval_spends(
+    rows: list[dict],
+    slice_seconds: int,
+    max_gap_minutes: int,
+    epoch: datetime,
+) -> list[float]:
+    """Pool positive per-slice spend amounts from a chronological row list.
+
+    Drops are bucketed into `slice_seconds`-wide slices relative to `epoch`,
+    summed within each slice (same semantics as the live window), and every
+    slice with spend > 0 contributes one pooled "interval" value.
+    """
+    drops = _collect_drops(rows, max_gap_minutes)
+    spend_by_slice: dict[int, float] = {}
+    for to_ts, drop in drops:
+        idx = math.floor((to_ts - epoch).total_seconds() / slice_seconds)
+        spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
+    return [spend for spend in spend_by_slice.values() if spend > 0]
+
+
+def _day_bucket_stats(
+    rows: list[tuple[datetime, float | None]],
+    day_start_utc: datetime,
+    slice_seconds: int,
+    max_gap_minutes: int,
+) -> tuple[float, dict[int, float]]:
+    """Bucket one complete day's snapshot rows into spend slices.
+
+    Returns ``(total_spend, spend_by_slice)`` for the day. ``rows`` must be the
+    snapshots (parsed to aware datetimes) whose timestamps fall inside
+    ``[day_start_utc, day_start_utc + 1d)``. Consecutive declines become
+    per-interval spend attributed to the slice the decline ended in, so usage
+    time (number of spent slices) and cost come from the *same* pool and the
+    resulting cost-per-minute is meaningful.
+    """
+    spend_by_slice: dict[int, float] = {}
+    for i in range(1, len(rows)):
+        prev_ts, prev_bal = rows[i - 1]
+        cur_ts, cur_bal = rows[i]
+        if prev_bal is None or cur_bal is None:
+            continue
+        gap_min = (cur_ts - prev_ts).total_seconds() / 60.0
+        if gap_min > max_gap_minutes:
+            continue
+        drop = prev_bal - cur_bal
+        if drop > 0:
+            idx = math.floor((cur_ts - day_start_utc).total_seconds() / slice_seconds)
+            spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
+    return sum(spend_by_slice.values()), spend_by_slice
+
+
+def daily_history_series(
+    db,
+    now: datetime,
+    *,
+    days: int | None = None,
+    spend_slice_minutes: int = 5,
+    max_gap_minutes: int = 30,
+) -> dict:
+    """Per-complete-day spend & usage-time series ending **yesterday** local.
+
+    Each returned day carries the total spend (sum of decline slices within the
+    day), the usage time (number of spent slices × slice width — a rough proxy
+    for how long the API was actually worked), and the derived
+    ``cost_per_minute`` (spend ÷ usage minutes).
+
+    ``days`` is the number of most-recent complete days to return (default: all
+    data from the earliest snapshot). Today is deliberately excluded — it is
+    partial — and should be shown separately alongside the series. Day
+    boundaries and labels are resolved in the caller's local timezone.
+    """
+    tz = now.tzinfo or UTC
+    now_aware = now if now.tzinfo else now.replace(tzinfo=UTC)
+    sod_local = _start_of_day_local(now_aware)
+    slice_seconds = spend_slice_minutes * 60
+
+    if days is not None and days > 0:
+        first_local = sod_local - timedelta(days=days)
+    else:
+        earliest_ts = db.earliest_ts()
+        if earliest_ts is None:
+            return {
+                "slice_minutes": spend_slice_minutes,
+                "start_date": None,
+                "end_date": None,
+                "days": [],
+            }
+        earliest = datetime.fromisoformat(earliest_ts).astimezone(tz)
+        first_local = _start_of_day_local(earliest)
+
+    last_local = sod_local - timedelta(days=1)  # yesterday = most recent complete day
+    if last_local < first_local:
+        return {
+            "slice_minutes": spend_slice_minutes,
+            "start_date": first_local.date().isoformat(),
+            "end_date": last_local.date().isoformat(),
+            "days": [],
+        }
+
+    rows = db.history(
+        first_local.astimezone(UTC).isoformat(),
+        before_iso=sod_local.astimezone(UTC).isoformat(),
+    )
+    parsed: list[tuple[datetime, float | None]] = []
+    for r in rows:
+        try:
+            parsed.append((datetime.fromisoformat(r["ts"]), r["total_balance"]))
+        except ValueError:
+            continue
+
+    out: list[dict] = []
+    day = first_local
+    while day <= last_local:
+        day_utc = day.astimezone(UTC)
+        next_utc = day_utc + timedelta(days=1)
+        day_rows = [
+            (ts, bal) for ts, bal in parsed if day_utc <= ts < next_utc
+        ]
+        spend, spend_by_slice = _day_bucket_stats(
+            day_rows, day_utc, slice_seconds, max_gap_minutes
+        )
+        usage_minutes = len(spend_by_slice) * spend_slice_minutes
+        out.append(
+            {
+                "date": day.date().isoformat(),
+                "ts": day.isoformat(),
+                "spend": spend,
+                "usage_minutes": usage_minutes,
+                "intervals_with_spend": len(spend_by_slice),
+                "cost_per_minute": (spend / usage_minutes) if usage_minutes > 0 else None,
+            }
+        )
+        day += timedelta(days=1)
+
+    return {
+        "slice_minutes": spend_slice_minutes,
+        "start_date": first_local.date().isoformat(),
+        "end_date": last_local.date().isoformat(),
+        "days": out,
+    }
+
+
+def _history_baseline_values(
+    db,
+    window_start_utc: datetime,
+    baseline_days: int,
+    slice_seconds: int,
+    max_gap_minutes: int,
+) -> list[float]:
+    """Pool spent-interval amounts from `baseline_days` complete days before
+    `window_start_utc`, to serve as a warm-up baseline when today has too few
+    spent intervals to be trusted on its own."""
+    if baseline_days <= 0:
+        return []
+    hist_start = window_start_utc - timedelta(days=baseline_days)
+    rows = db.history(hist_start.isoformat(), before_iso=window_start_utc.isoformat())
+    return _pool_interval_spends(rows, slice_seconds, max_gap_minutes, hist_start)
+
+
 def spend_intervals(
     db,
     now: datetime,
@@ -68,6 +249,7 @@ def spend_intervals(
     min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
     normal_band: float = 2.0,
     max_gap_minutes: int = 30,
+    baseline_days: int = 14,
 ) -> dict:
     """Bucket spend into fixed intervals and classify each spent one.
 
@@ -79,6 +261,12 @@ def spend_intervals(
     The window runs for `summary_hours` ending at `now`, unless an explicit
     `summary_start_utc` is given (e.g. the start of today) in which case it
     spans from there to `now`.
+
+    Classification always prefers the pooled spent intervals from the prior
+    `baseline_days` complete days — a larger, more robust sample than today's
+    handful of intervals. It falls back to today's own spent intervals only
+    when there is no prior history to draw on yet, and reports `baseline_source`
+    so callers can see which one was used.
     """
     now_utc = now.astimezone(UTC)
     slice_seconds = spend_slice_minutes * 60
@@ -93,18 +281,7 @@ def spend_intervals(
     )
 
     # Per-interval drops, attributed to the slice the decline ended in.
-    drops: list[tuple[datetime, float]] = []
-    for i in range(1, len(sum_rows)):
-        prev = sum_rows[i - 1]
-        cur = sum_rows[i]
-        if prev["total_balance"] is None or cur["total_balance"] is None:
-            continue
-        gap_min = _minutes_between(prev["ts"], cur["ts"])
-        if gap_min is None or gap_min > max_gap_minutes:
-            continue
-        drop = prev["total_balance"] - cur["total_balance"]
-        if drop > 0:
-            drops.append((datetime.fromisoformat(cur["ts"]), drop))
+    drops = _collect_drops(sum_rows, max_gap_minutes)
 
     n_slices = math.ceil(
         (now_utc - summary_start_utc).total_seconds() / slice_seconds
@@ -122,14 +299,44 @@ def spend_intervals(
     )
     values = [spend for _, spend in spent]
     interval_count = len(values)
-    median_interval = _median(values)
-    enough_data = interval_count >= min_intervals_for_baseline
+    today_median = _median(values)
+    today_enough = interval_count >= min_intervals_for_baseline
+
+    # Warm-up baseline from prior complete days, so classification can work
+    # early in the day before today has enough spent intervals to be trusted.
+    hist_values: list[float] = []
+    hist_enough = False
+    if baseline_days > 0:
+        hist_values = _history_baseline_values(
+            db,
+            summary_start_utc.astimezone(UTC),
+            baseline_days,
+            slice_seconds,
+            max_gap_minutes,
+        )
+        hist_enough = len(hist_values) >= min_intervals_for_baseline
+
+    enough_data = today_enough or hist_enough
+
+    # Always prefer the pooled history baseline: it's a larger, more robust
+    # sample than today's handful of intervals. Fall back to today's own spent
+    # intervals only when there's no history to draw on yet.
+    baseline_source = "none"
+    median_interval = today_median  # reported even before enough data
+    spread_values: list[float] = []
+    if hist_enough:
+        baseline_source = "history"
+        median_interval = _median(hist_values)
+        spread_values = hist_values
+    elif today_enough:
+        baseline_source = "today"
+        spread_values = values
 
     threshold = None
     below_floor = None
     buckets: dict[str, int] = {"high": 0, "normal": 0, "below": 0}
     if enough_data and median_interval is not None:
-        spread = _mad(values, median_interval)
+        spread = _mad(spread_values, median_interval)
         threshold = max(median_interval + spike_mult * spread, median_interval * spike_min_ratio)
         below_floor = median_interval / normal_band
 
@@ -162,6 +369,9 @@ def spend_intervals(
         "total_slices": n_slices,
         "enough_data": enough_data,
         "min_intervals_for_baseline": min_intervals_for_baseline,
+        "baseline_source": baseline_source,
+        "hist_interval_count": len(hist_values),
+        "hist_median_interval": _median(hist_values),
         "thresholds": {
             "median": median_interval,
             "avg": statistics.mean(values) if values else None,
@@ -196,6 +406,7 @@ def daily_heartbeat(
     spike_min_ratio: float = SPIKE_MIN_RATIO,
     min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
     normal_band: float = 2.0,
+    baseline_days: int = 14,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -300,14 +511,19 @@ def daily_heartbeat(
         min_intervals_for_baseline=min_intervals_for_baseline,
         normal_band=normal_band,
         max_gap_minutes=max_gap_minutes,
+        baseline_days=baseline_days,
     )
     spend_summary = {
         "window_hours": si["window_hours"],
         "slice_minutes": si["slice_minutes"],
         "total_slices": si["total_slices"],
         "intervals_with_spend": si["summary"]["intervals_with_spend"],
+        "usage_minutes": si["summary"]["intervals_with_spend"] * si["slice_minutes"],
         "enough_data": si["enough_data"],
         "min_intervals_for_baseline": si["min_intervals_for_baseline"],
+        "baseline_source": si["baseline_source"],
+        "hist_interval_count": si["hist_interval_count"],
+        "hist_median_interval": si["hist_median_interval"],
         "median_interval_spend": si["thresholds"]["median"],
         "avg_interval_spend": si["thresholds"]["avg"],
         "spike_threshold": si["thresholds"]["spike_threshold"],
