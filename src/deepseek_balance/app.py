@@ -437,6 +437,7 @@ HISTORY_HTML = """<!DOCTYPE html>
   <div class="legend">
     <span class="sw" style="background:#38bdf8"></span>spend (<span id="legCur">currency</span>, left axis)
     <span class="sw" style="background:#a78bfa"></span>usage time (right axis)
+    <span class="sw" style="background:transparent;border:1px dashed #7dd3fc"></span>today = projected
   </div>
   <div class="chartwrap" id="chartwrap"><div class="muted" id="chartMsg">Loading…</div></div>
 
@@ -492,6 +493,7 @@ function niceStep(raw) {
 }
 
 let cur = "";
+let today = null;            // full /balance/daily doc; drives the projected "today" bar
 const state = { days: 14 };
 
 async function getJSON(url) {
@@ -502,7 +504,12 @@ async function getJSON(url) {
 
 async function loadCards() {
   const d = await getJSON(DAILY + "?now=" + encodeURIComponent(localIso()));
-  if (d.error || d.current_balance == null) { document.getElementById("sSpent").textContent = "waiting for first snapshot"; return; }
+  if (d.error || d.current_balance == null) {
+    today = null;
+    document.getElementById("sSpent").textContent = "waiting for first snapshot";
+    return;
+  }
+  today = d;
   cur = d.currency || "";
   document.getElementById("legCur").textContent = cur || "currency";
   const ss = d.spend_summary || {};
@@ -515,31 +522,57 @@ async function loadCards() {
   document.getElementById("sBal").textContent = "updated " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
     " · projected " + fmt(d.projected_spend, cur) + " today";
   document.getElementById("sub").textContent =
-    "Today's numbers (left cards) refresh live; bars are complete days up to yesterday.";
+    "Today's numbers (left cards) refresh live. On the chart, today's bar is the projected full-day spend — hatched to show it's an estimate, not history.";
 }
 
 function svgText(x, y, str, anchor, fill, size) {
   return '<text x="' + x + '" y="' + y + '" text-anchor="' + (anchor || "middle") + '" fill="' + (fill || "#94a3b8") + '" font-size="' + (size || 10) + '">' + str + "</text>";
 }
 
+// Today as a *projected* bar: spend is the full-day projection (annualised
+// from the current pace), usage is the partial actual so far. Returns null
+// when there's no live data yet, so the chart then shows complete days only.
+function todayPoint() {
+  if (!today || today.current_balance == null) return null;
+  const useMin = (today.spend_summary || {}).usage_minutes || 0;
+  const proj = today.projected_spend;
+  const spent = today.spent_today;
+  if (proj == null && spent == null) return null;
+  const isProj = proj != null;
+  const spendVal = isProj ? proj : spent;
+  const cpm = spent != null && useMin > 0 ? spent / useMin : null;
+  const date = today.start_of_day ? today.start_of_day.slice(0, 10) : "";
+  return {
+    date: date,
+    spend: spendVal,
+    usage_minutes: useMin,
+    intervals_with_spend: 0,
+    cost_per_minute: cpm,
+    is_today: true,
+    projected: isProj,
+  };
+}
+
 function renderChart(data) {
   const box = document.getElementById("chartwrap");
-  const days = (data && data.days) || [];
+  const hist = (data && data.days) || [];          // complete days (excl today)
+  const tday = todayPoint();                        // projected today (or null)
+  const days = tday ? hist.concat([tday]) : hist;   // drawn series incl today
   if (!days.length) {
-    box.innerHTML = '<div class="muted">No complete days of data yet — check back after your first full day.</div>';
+    box.innerHTML = '<div class="muted">No day data yet — check back after a little usage.</div>';
     return;
   }
+
   const spendMax = Math.max.apply(null, days.map(d => d.spend)) || 1;
   const useMax = Math.max.apply(null, days.map(d => d.usage_minutes)) || 1;
   const stepL = niceStep(spendMax / 4), topL = Math.ceil(spendMax / stepL) * stepL;
   const stepR = niceStep(useMax / 4), topR = Math.ceil(useMax / stepR) * stepR;
 
   const n = days.length;
-  const padL = 46, padR = 46, padT = 8, padB = 26;
-  const slot = n <= 14 ? 42 : n <= 31 ? 30 : Math.max(14, Math.min(22, 2400 / n));
+  const padL = 46, padR = 52, padT = 8, padB = 28;
+  const slot = n <= 15 ? 40 : n <= 32 ? 28 : Math.max(13, Math.min(22, 2400 / n));
   const width = n * slot + padL + padR;
   const plotH = 220, height = plotH + padT + padB;
-  const plotW = width - padL - padR;
   const barW = Math.min(slot * 0.36, 34);
   const y = (frac) => padT + plotH * (1 - frac);
 
@@ -558,32 +591,54 @@ function renderChart(data) {
   const labelEvery = Math.max(1, Math.ceil(n / 14));
   for (let i = 0; i < n; i++) {
     const d = days[i];
+    const isT = !!d.is_today;
     const cx = padL + i * slot + slot / 2;
     const sf = d.spend / topL, uf = d.usage_minutes / topR;
     const hS = sf * plotH, hU = uf * plotH;
     const xS = cx - barW - 1.5, xU = cx + 1.5;
-    s += '<rect x="' + xS.toFixed(1) + '" y="' + y(sf).toFixed(1) + '" width="' + barW + '" height="' + hS.toFixed(1) + '" fill="#38bdf8" rx="1"><title>' +
-      d.date + " spend " + fmtMoney(d.spend, cur) + (d.cost_per_minute != null ? " · " + fmtCpm(d.cost_per_minute, cur) : "") + "</title></rect>";
-    s += '<rect x="' + xU.toFixed(1) + '" y="' + y(uf).toFixed(1) + '" width="' + barW + '" height="' + hU.toFixed(1) + '" fill="#a78bfa" rx="1" opacity="0.85"><title>' +
-      d.date + " usage " + fmtDur(d.usage_minutes) + "</title></rect>";
-    if (i % labelEvery === 0) {
-      s += svgText(cx, height - 8, d.date.slice(5));
+    const xS2 = xS.toFixed(1), yS2 = y(sf).toFixed(1), hS2 = hS.toFixed(1);
+    const xU2 = xU.toFixed(1), yU2 = y(uf).toFixed(1), hU2 = hU.toFixed(1);
+    const titleS = d.date + (isT ? " (today — projected)" : "") + " spend " + fmtMoney(d.spend, cur) +
+      (d.cost_per_minute != null ? " · " + fmtCpm(d.cost_per_minute, cur) : "");
+    const titleU = d.date + (isT ? " (today — so far)" : "") + " usage " + fmtDur(d.usage_minutes);
+
+    if (isT) {
+      // Historical days: solid fill. Today: translucent + dashed outline so it
+      // reads as an estimate, plus a divider to set it apart.
+      s += '<line x1="' + (cx - slot / 2 + 2).toFixed(1) + '" y1="' + padT + '" x2="' + (cx - slot / 2 + 2).toFixed(1) + '" y2="' + (padT + plotH) + '" stroke="rgba(125,211,252,.25)" stroke-dasharray="2 3"/>';
+      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="rgba(56,189,248,.20)" rx="1"><title>' + titleS + "</title></rect>";
+      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="none" stroke="#38bdf8" stroke-dasharray="4 3" rx="1"/>';
+      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="rgba(167,139,250,.20)" rx="1" opacity="0.9"><title>' + titleU + "</title></rect>";
+      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="none" stroke="#a78bfa" stroke-dasharray="4 3" rx="1" opacity="0.9"/>';
+      // Annotate it (always) so the estimate is unmistakable.
+      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 14).toFixed(1) + '" text-anchor="middle" fill="#7dd3fc" font-size="9">today</text>';
+      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 24).toFixed(1) + '" text-anchor="middle" fill="#67e8f9" font-size="8">' + (d.projected ? "~proj" : "so far") + "</text>";
+    } else {
+      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="#38bdf8" rx="1"><title>' + titleS + "</title></rect>";
+      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="#a78bfa" rx="1" opacity="0.85"><title>' + titleU + "</title></rect>";
+      if (i % labelEvery === 0) {
+        s += svgText(cx, height - 8, d.date.slice(5));
+      }
     }
   }
   s += "</svg>";
   box.innerHTML = s;
 
-  const totSpend = days.reduce((a, d) => a + d.spend, 0);
-  const totUse = days.reduce((a, d) => a + d.usage_minutes, 0);
-  const daysWithUse = days.filter(d => d.usage_minutes > 0);
+  // Range summary cards always reflect *complete* days only (never the today
+  // projection), so "range spend" isn't inflated by an estimate.
+  const totSpend = hist.reduce((a, d) => a + d.spend, 0);
+  const totUse = hist.reduce((a, d) => a + d.usage_minutes, 0);
+  const daysWithUse = hist.filter(d => d.usage_minutes > 0);
   const wCpm = totUse > 0 ? totSpend / totUse : null;
-  const wCpmPerDay = wCpm != null && daysWithUse.length
+  const wCpmPerDay = daysWithUse.length
     ? daysWithUse.reduce((a, d) => a + d.cost_per_minute, 0) / daysWithUse.length : null;
-  const label = state.days === 0 ? "since " + days[0].date : "last " + days.length + " complete days";
+  const label = state.days === 0
+    ? (hist.length ? "since " + hist[0].date : "no complete days yet")
+    : "last " + hist.length + " complete days";
   document.getElementById("cTotal").textContent = fmtMoney(totSpend, cur);
   document.getElementById("sTotal").textContent = label;
   document.getElementById("cUse").textContent = fmtDur(totUse);
-  document.getElementById("sUse").textContent = "≈ " + (totUse / 60).toFixed(1) + "h active across " + days.length + " days";
+  document.getElementById("sUse").textContent = "≈ " + (totUse / 60).toFixed(1) + "h active across " + hist.length + " days";
   document.getElementById("cCpm").textContent = fmtCpm(wCpm, cur);
   document.getElementById("sCpm").textContent = "avg day " + fmtCpm(wCpmPerDay, cur) + " · hover bars for daily";
 }
@@ -606,8 +661,13 @@ document.getElementById("range").addEventListener("click", (ev) => {
   loadChart();
 });
 
-loadCards().catch(e => { document.getElementById("sSpent").textContent = "failed to load: " + e.message; });
-loadChart();
+// Load today first so the chart can draw the projected today bar on first paint.
+async function initAll() {
+  try { await loadCards(); }
+  catch (e) { document.getElementById("sSpent").textContent = "failed to load: " + e.message; }
+  await loadChart();
+}
+initAll();
 </script>
 </body>
 </html>
