@@ -256,17 +256,11 @@ WIDGET_HTML = """<!DOCTYPE html>
   .at { color: #60a5fa; }
   .dn { color: #34d399; }
   .error { color: #f87171; padding: 8px; }
-  .topbar { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-  .drill { font-size: 10px; color: #7dd3fc; text-decoration: none; white-space: nowrap; }
-  .drill:hover { text-decoration: underline; }
   .muted-line { opacity: .55; }
 </style>
 </head>
 <body>
-  <div class="topbar">
-    <h1>DeepSeek Balance</h1>
-    <a class="drill" id="drill" href="/history" target="_blank" rel="noopener" title="Spend & usage by day">History ↗</a>
-  </div>
+  <h1>DeepSeek Balance</h1>
   <div class="meta" id="meta">Loading…</div>
   <div class="balance" id="balance">—</div>
   <div class="sub" id="sub"></div>
