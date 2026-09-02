@@ -154,19 +154,23 @@ def daily_history_series(
     sod_local = _start_of_day_local(now_aware)
     slice_seconds = spend_slice_minutes * 60
 
+    # Earliest day we actually hold any snapshot for. Used to clip the range so
+    # we never pad the chart with blank bars from before collection began.
+    earliest_ts = db.earliest_ts()
+    if earliest_ts is None:
+        return {
+            "slice_minutes": spend_slice_minutes,
+            "start_date": None,
+            "end_date": None,
+            "days": [],
+        }
+    earliest_local = datetime.fromisoformat(earliest_ts).astimezone(tz)
+    earliest_day = _start_of_day_local(earliest_local)
+
     if days is not None and days > 0:
-        first_local = sod_local - timedelta(days=days)
+        first_local = max(sod_local - timedelta(days=days), earliest_day)
     else:
-        earliest_ts = db.earliest_ts()
-        if earliest_ts is None:
-            return {
-                "slice_minutes": spend_slice_minutes,
-                "start_date": None,
-                "end_date": None,
-                "days": [],
-            }
-        earliest = datetime.fromisoformat(earliest_ts).astimezone(tz)
-        first_local = _start_of_day_local(earliest)
+        first_local = earliest_day  # all data from the first snapshot's day
 
     last_local = sod_local - timedelta(days=1)  # yesterday = most recent complete day
     if last_local < first_local:

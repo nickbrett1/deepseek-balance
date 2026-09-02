@@ -461,12 +461,15 @@ def test_days_endpoint(client):
     assert r.status_code == 200
     body = r.json()
     assert "currency" in body
-    # days=3 covers 3 complete days (today excluded); one seeded day may be empty.
-    assert len(body["days"]) == 3
+    # Range is clipped to where data actually exists (no leading blank bars):
+    # two seeded days means two complete days regardless of the requested 3.
+    assert len(body["days"]) == 2
     assert all("usage_minutes" in d and "cost_per_minute" in d for d in body["days"])
     assert body["days"][-1]["usage_minutes"] == 15
     # Today's date must never appear in the series (partial day excluded).
     assert body["days"][-1]["date"] != datetime.now(UTC).date().isoformat()
+    # The series starts on the first day that has data, not 3 days back.
+    assert body["days"][0]["usage_minutes"] == 15
 
 
 def test_daily_endpoint(client):

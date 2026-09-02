@@ -79,20 +79,32 @@ environment variables:
 The data endpoint is `/balance/daily` (accepts an optional `now` query param
 carrying the client's local time so "today" matches the viewer's timezone).
 
-### Usage time & the History drill-in (`/history`)
+### Usage time, history & the three daily charts
 
 The **Spend — today** summary also reports **Usage time** — a rough proxy for
 how long the API was actively worked, defined as the number of spend intervals
-with spend × the interval width (e.g. `SPEND_SLICE_MINUTES`). A "History ↗"
-link on the homepage opens the drill-in view at `/history`, which pairs the
-live today's numbers with a grouped bar chart of **previous complete days**
-(today is partial and deliberately excluded). Each day shows two bars: total
-**spend** (left axis) and **usage time** (right axis), so you can eyeball both
-cost and the time that bought it. A range toggle switches between the last
-**14 days** (default), **last month**, and **all time** (from the earliest
-snapshot). Every bar's tooltip also shows that day's **cost-per-minute**
-(spend ÷ usage minutes), and the page's cards total spend, usage and the
-usage-weighted overall cost/min across the visible range.
+with spend × the interval width (e.g. `SPEND_SLICE_MINUTES`).
+
+Everything now lives on the **single homepage page** (`/`; `/history` is a
+back-compat alias). Under today's heartbeat and interval summary, three
+separate charts show the previous days (each range has its own scale, so no
+dual-axis juggling):
+
+1. **Spend per day** — total spend per complete day.
+2. **Usage time per day** — minutes of active use (spent slices × width).
+3. **Cost per hour** — spend ÷ active hours, shown in the **minor unit**
+   (cents / fen, i.e. ×100) per hour for readability, since per-minute figures
+   are tiny.
+
+Today appears as the **rightmost dashed bar** on each chart — spend uses the
+**projected** full-day amount, usage uses the partial actual so far, so an
+estimate is never confused with history. A range toggle switches between the
+last **14 days** (default), **last month**, and **all time**. Ranges are
+**clipped to where data actually exists**, so no blank bars pad the start
+before you began collecting. A summary line shows the **average** spend/day,
+usage/day and cost/hour across the complete days in view (today's estimate is
+excluded from those averages). Charts are fully responsive with no horizontal
+scroll, so they work on a phone.
 
 The data endpoint is `/balance/days` (`days` = number of complete days, or `0`
 for all time; `now` optional for local day alignment).

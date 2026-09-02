@@ -219,7 +219,8 @@ def index() -> str:
 
 @app.get("/history", response_class=HTMLResponse)
 def history_page() -> str:
-    return HISTORY_HTML
+    """Back-compat alias: everything now lives on the single homepage page."""
+    return WIDGET_HTML
 
 
 WIDGET_HTML = """<!DOCTYPE html>
@@ -229,14 +230,18 @@ WIDGET_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DeepSeek Balance</title>
 <style>
+  :root { color-scheme: dark; }
   html, body { background: #0f172a; }
-  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 12px 14px 8px; font-size: 12.5px; line-height: 1.35; color: #e2e8f0; }
-  h1 { font-size: 13px; margin: 0 0 2px; font-weight: 600; }
-  .meta { font-size: 10px; opacity: .55; margin-bottom: 4px; }
-  .balance { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .balance small { font-size: 11px; font-weight: 500; opacity: .6; }
-  .sub { font-size: 10px; opacity: .65; margin-top: 2px; }
-  .heart-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 14px 16px 30px; font-size: 13px; line-height: 1.4; color: #e2e8f0; }
+  a { color: #7dd3fc; }
+  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  .meta { font-size: 11px; opacity: .6; margin-bottom: 8px; }
+  .topcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .card { background: rgba(30,41,59,.55); border: 1px solid rgba(148,163,184,.14); border-radius: 8px; padding: 8px 10px; }
+  .card .t { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
+  .card .v { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .card .s { font-size: 11px; opacity: .7; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .section-title { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; opacity: .6; margin: 16px 0 6px; font-weight: 600; }
   .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(148,163,184,.12); }
   .row:last-child { border-bottom: 0; }
   .row .k { opacity: .65; }
@@ -246,200 +251,55 @@ WIDGET_HTML = """<!DOCTYPE html>
   .pill.warn { background: rgba(251,146,60,.15); color: #fdba74; }
   .pill.bad { background: rgba(248,113,113,.18); color: #fca5a5; }
   .pill.muted { background: rgba(148,163,184,.15); color: #94a3b8; }
-  .summary-title { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; margin: 8px 0 2px; }
-  .summary .row .v { font-weight: 500; }
-  .up { color: #fb923c; }
-  .at { color: #60a5fa; }
-  .dn { color: #34d399; }
-  .error { color: #f87171; padding: 8px; }
-  .topbar { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-  .drill { font-size: 10px; color: #7dd3fc; text-decoration: none; white-space: nowrap; }
-  .drill:hover { text-decoration: underline; }
-  .muted-line { opacity: .55; }
-</style>
-</head>
-<body>
-  <div class="topbar">
-    <h1>DeepSeek Balance</h1>
-    <a class="drill" id="drill" href="/history" target="_blank" rel="noopener" title="Spend & usage by day">History ↗</a>
-  </div>
-  <div class="meta" id="meta">Loading…</div>
-  <div class="balance" id="balance">—</div>
-  <div class="sub" id="sub"></div>
-  <div class="heart-title">Today’s heartbeat</div>
-  <div id="heart">Loading…</div>
-  <div class="summary-title" id="summaryTitle">Spend — today</div>
-  <div class="summary" id="summary">Loading…</div>
-<script>
-const DAILY = "/balance/daily";
-
-function pad(n) { return String(n).padStart(2, "0"); }
-
-// Local ISO-8601 timestamp with offset so the server's "today" matches ours.
-function localIso() {
-  const d = new Date();
-  const off = -d.getTimezoneOffset();            // minutes east of UTC
-  const sign = off >= 0 ? "+" : "-";
-  const abs = Math.abs(off);
-  const tz = sign + pad(Math.floor(abs / 60)) + ":" + pad(abs % 60);
-  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
-    "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
-    "." + String(d.getMilliseconds()).padStart(3, "0") + tz;
-}
-
-function fmt(v, cur) {
-  if (v == null) return "—";
-  return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
-}
-
-// Render minutes as a compact "2h 15m" (or "45m").
-function fmtDur(min) {
-  if (min == null) return "—";
-  const m = Math.round(Number(min));
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return (h ? h + "h " : "") + mm + "m";
-}
-
-async function load() {
-  try {
-    const r = await fetch(DAILY + "?now=" + encodeURIComponent(localIso()), { cache: "no-store" });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
-    if (d.error || d.current_balance == null) {
-      document.getElementById("balance").textContent = "No data yet";
-      document.getElementById("heart").innerHTML = '<div class="meta">Waiting for the first snapshot…</div>';
-      return;
-    }
-    renderHeader(d);
-    renderHeart(d);
-    renderSummary(d);
-  } catch (e) {
-    document.getElementById("heart").innerHTML = '<div class="error">Failed to load: ' + e.message + "</div>";
-  }
-}
-
-function renderHeader(d) {
-  document.getElementById("balance").innerHTML =
-    fmt(d.current_balance) + " <small>" + (d.currency || "") + "</small>";
-  document.getElementById("sub").textContent = "started the day at " + fmt(d.prev_balance, d.currency);
-  const t = new Date(d.current_ts);
-  document.getElementById("meta").textContent =
-    "Updated " + t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) +
-    " · " + t.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-function pacing(svn) {
-  if (svn == null) return ["muted", "no baseline"];
-  if (svn < 0.7) return ["ok", "below avg"];
-  if (svn <= 1.3) return ["ok", "on track"];
-  return ["warn", "above normal"];
-}
-
-function renderHeart(d) {
-  const [cls, label] = pacing(d.spend_vs_normal);
-  const pill = '<span class="pill ' + cls + '">' + label + "</span>";
-  const rows = [
-    { k: "Spent today", v: fmt(d.spent_today, d.currency) + pill },
-    { k: "Spend yesterday", v: fmt(d.spent_yesterday, d.currency) },
-    { k: "Typical day", v: fmt(d.normal_spend, d.currency) },
-    { k: "Projected spend today", v: fmt(d.projected_spend, d.currency) },
-  ];
-  document.getElementById("heart").innerHTML = rows.map((r) =>
-    '<div class="row"><span class="k">' + r.k + '</span><span class="v">' + r.v + "</span></div>"
-  ).join("");
-}
-
-function renderSummary(d) {
-  const s = d.spend_summary || {};
-  const el = document.getElementById("summary");
-  document.getElementById("summaryTitle").textContent =
-    "Spend — " + s.slice_minutes + " min intervals · today";
-  const total = s.intervals_with_spend || 0;
-  if (total === 0) {
-    el.innerHTML = '<div class="meta">No spend today.</div>';
-    return;
-  }
-  const pct = (n) => Math.round((n / total) * 100) + "%";
-  let rows = '<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>";
-  rows += '<div class="row"><span class="k">Median interval</span><span class="v">' + fmt(s.median_interval_spend, d.currency) + "</span></div>";
-  rows += '<div class="row"><span class="k">Usage time</span><span class="v">' + fmtDur(s.usage_minutes) + "</span></div>";
-  if (!s.enough_data) {
-    const need = Math.max(0, s.min_intervals_for_baseline - total);
-    el.innerHTML = rows + '<div class="meta">Need ' + s.min_intervals_for_baseline +
-      " spent intervals to judge unusual spend — " + total + " so far" + (need ? " (" + need + " more)" : "") + ".</div>";
-    return;
-  }
-  const pctN = (n) => pct(n || 0);
-  rows += '<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
-    " (" + pctN(s.unusually_high_count) + ") · over " + fmt(s.spike_threshold, d.currency) + "</span></div>";
-  rows += '<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
-    " (" + pctN(s.normal_count) + ") · " + fmt(s.below_floor, d.currency) + "–" + fmt(s.spike_threshold, d.currency) + "</span></div>";
-  rows += '<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
-    " (" + pctN(s.below_count) + ") · under " + fmt(s.below_floor, d.currency) + "</span></div>";
-  el.innerHTML = rows;
-}
-
-load();
-</script>
-</body>
-</html>
-"""
-
-HISTORY_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DeepSeek Balance · History</title>
-<style>
-  :root { color-scheme: dark; }
-  html, body { background: #0f172a; }
-  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 18px 20px 30px; font-size: 13px; line-height: 1.4; color: #e2e8f0; }
-  a { color: #7dd3fc; }
-  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
-  .back { font-size: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 12px 0; }
-  .card { background: rgba(30,41,59,.55); border: 1px solid rgba(148,163,184,.14); border-radius: 8px; padding: 10px 12px; }
-  .card .t { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; }
-  .card .v { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
-  .card .s { font-size: 11px; opacity: .7; margin-top: 2px; font-variant-numeric: tabular-nums; }
-  .seg { display: inline-flex; border: 1px solid rgba(148,163,184,.25); border-radius: 6px; overflow: hidden; margin: 10px 0 4px; }
+  .up { color: #fb923c; } .at { color: #60a5fa; } .dn { color: #34d399; }
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid rgba(148,163,184,.25); border-radius: 6px; overflow: hidden; margin: 4px 0 8px; }
   .seg button { background: transparent; color: #cbd5e1; border: 0; padding: 5px 12px; font-size: 12px; cursor: pointer; }
   .seg button.on { background: #334155; color: #f1f5f9; }
-  .legend { font-size: 11px; opacity: .75; margin-bottom: 4px; }
-  .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 5px 0 12px; vertical-align: -1px; }
-  .chartwrap { overflow-x: auto; border: 1px solid rgba(148,163,184,.14); border-radius: 8px; background: rgba(15,23,42,.4); padding: 10px; }
-  .muted { opacity: .55; }
+  .avgline { font-size: 11px; opacity: .85; margin: 2px 0 10px; }
+  .avgline b { font-variant-numeric: tabular-nums; }
+  .chart { background: rgba(15,23,42,.35); border: 1px solid rgba(148,163,184,.13); border-radius: 8px; padding: 8px 10px 4px; margin-bottom: 12px; }
+  .chart h3 { font-size: 12px; font-weight: 600; margin: 0 0 2px; }
+  .chart .note { font-size: 10px; opacity: .6; margin-bottom: 4px; }
+  .chart svg { width: 100%; height: auto; display: block; }
   .err { color: #f87171; }
+  .muted { opacity: .55; }
   svg text { font-family: ui-sans-serif, system-ui, sans-serif; }
+  .todaycard { display:grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
 </style>
 </head>
 <body>
-  <div class="back"><a href="/">&larr; back to today</a></div>
-  <h1>DeepSeek Balance · by day</h1>
-  <div class="muted" id="sub">Loading…</div>
+  <h1>DeepSeek Balance</h1>
+  <div class="meta" id="meta">Loading…</div>
 
+  <div class="section-title">Today’s heartbeat</div>
+  <div class="card" id="heart"><div class="muted">Loading…</div></div>
+
+  <div class="section-title">Spend — today <span id="sliceNote"></span></div>
+  <div class="card" id="summary"><div class="muted">Loading…</div></div>
+
+  <div class="section-title">History by day</div>
   <div class="seg" id="range">
     <button data-days="14" class="on">14 days</button>
     <button data-days="30">Last month</button>
     <button data-days="0">All time</button>
   </div>
+  <div class="avgline" id="avgline"></div>
 
-  <div class="grid" id="cards">
-    <div class="card"><div class="t">Spent today</div><div class="v" id="cSpent">—</div><div class="s" id="sSpent">usage 0m · —/min</div></div>
-    <div class="card"><div class="t">Balance now</div><div class="v" id="cBal">—</div><div class="s" id="sBal"></div></div>
-    <div class="card"><div class="t">Range spend</div><div class="v" id="cTotal">—</div><div class="s" id="sTotal"></div></div>
-    <div class="card"><div class="t">Range usage</div><div class="v" id="cUse">—</div><div class="s" id="sUse"></div></div>
-    <div class="card"><div class="t">Overall cost / min</div><div class="v" id="cCpm">—</div><div class="s" id="sCpm">usage-weighted avg</div></div>
+  <div class="chart">
+    <h3>Spend per day <span style="font-weight:400;opacity:.7">(<span id="legCur">currency</span>)</span></h3>
+    <div class="note">Today’s bar is dashed = projected full-day spend. Hover for detail.</div>
+    <div id="cSpend"></div>
   </div>
-
-  <div class="legend">
-    <span class="sw" style="background:#38bdf8"></span>spend (<span id="legCur">currency</span>, left axis)
-    <span class="sw" style="background:#a78bfa"></span>usage time (right axis)
-    <span class="sw" style="background:transparent;border:1px dashed #7dd3fc"></span>today = projected
+  <div class="chart">
+    <h3>Usage time per day</h3>
+    <div class="note">Minutes with spend × 5-min slices — a rough proxy for active time.</div>
+    <div id="cUsage"></div>
   </div>
-  <div class="chartwrap" id="chartwrap"><div class="muted" id="chartMsg">Loading…</div></div>
+  <div class="chart">
+    <h3>Cost per hour <span style="font-weight:400;opacity:.7">(in <span id="legMinor">¢</span>/hour)</span></h3>
+    <div class="note">Spend ÷ active hours. Lower = cheaper use. Blank days had no usage.</div>
+    <div id="cCost"></div>
+  </div>
 
 <script>
 const DAILY = "/balance/daily";
@@ -461,27 +321,118 @@ function fmt(v, cur) {
   if (v == null) return "—";
   return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (cur ? " " + cur : "");
 }
+function fmtMoney(v, cur) {
+  if (v == null) return "—";
+  const s = v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return s + (cur ? " " + cur : "");
+}
 function fmtDur(min) {
   if (min == null) return "—";
   const m = Math.round(Number(min));
   const h = Math.floor(m / 60), mm = m % 60;
   return (h ? h + "h " : "") + mm + "m";
 }
-function fmtMoney(v, cur) {
-  if (v == null) return "—";
-  const s = v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
-  return s + (cur ? " " + cur : "");
+function minorUnit(cur) {
+  const c = (cur || "").toUpperCase();
+  if (c.indexOf("CNY") === 0 || c.indexOf("RMB") === 0) return "分";
+  return "¢";
 }
-function fmtCpm(v, cur) {
-  if (v == null) return "—";
-  const per = v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toExponential(1);
-  return per + (cur ? " " + cur : "") + "/min";
+function fmtMinorInt(v) { // minor-unit hourly number, integer-ish
+  return Math.round(v).toLocaleString();
 }
-function fmtRight(min) {
-  const m = Math.round(Number(min));
-  if (m >= 60) { const h = m / 60; return (h % 1 === 0 ? h : h.toFixed(1)) + "h"; }
-  return m + "m";
+
+const state = { days: 14 };
+let cur = "";
+let today = null;   // full /balance/daily doc
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
 }
+
+// ---- today panel ---------------------------------------------------------
+
+function pacing(svn) {
+  if (svn == null) return ["muted", "no baseline"];
+  if (svn < 0.7) return ["ok", "below avg"];
+  if (svn <= 1.3) return ["ok", "on track"];
+  return ["warn", "above normal"];
+}
+
+function renderToday(d) {
+  const [cls, label] = pacing(d.spend_vs_normal);
+  const pill = '<span class="pill ' + cls + '">' + label + "</span>";
+  const rows = [
+    { k: "Spent today", v: fmtMoney(d.spent_today, d.currency) + pill },
+    { k: "Spend yesterday", v: fmtMoney(d.spent_yesterday, d.currency) },
+    { k: "Typical day", v: fmtMoney(d.normal_spend, d.currency) },
+    { k: "Projected spend today", v: fmtMoney(d.projected_spend, d.currency) },
+    { k: "Balance now", v: fmtMoney(d.current_balance, d.currency) },
+    { k: "Started day at", v: fmtMoney(d.prev_balance, d.currency) },
+  ];
+  document.getElementById("heart").innerHTML = rows.map(r =>
+    '<div class="row"><span class="k">' + r.k + '</span><span class="v">' + r.v + "</span></div>").join("");
+}
+
+function renderSummary(d) {
+  const s = d.spend_summary || {};
+  const el = document.getElementById("summary");
+  document.getElementById("sliceNote").textContent = "(" + s.slice_minutes + " min intervals)";
+  const total = s.intervals_with_spend || 0;
+  if (total === 0) { el.innerHTML = '<div class="muted">No spend today.</div>'; return; }
+  const pct = (n) => Math.round((n || 0) / total * 100) + "%";
+  const rows = [];
+  rows.push('<div class="row"><span class="k">Intervals with spend</span><span class="v">' + total + "</span></div>");
+  rows.push('<div class="row"><span class="k">Usage time</span><span class="v">' + fmtDur(s.usage_minutes) + "</span></div>");
+  rows.push('<div class="row"><span class="k">Median interval</span><span class="v">' + fmtMoney(s.median_interval_spend, d.currency) + "</span></div>");
+  if (!s.enough_data) {
+    el.innerHTML = rows.join("") + '<div class="muted">Need ' + s.min_intervals_for_baseline +
+      " spent intervals to judge unusual spend — " + total + " so far.</div>";
+    return;
+  }
+  rows.push('<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
+    " (" + pct(s.unusually_high_count) + ")</span></div>");
+  rows.push('<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
+    " (" + pct(s.normal_count) + ")</span></div>");
+  rows.push('<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
+    " (" + pct(s.below_count) + ")</span></div>");
+  el.innerHTML = rows.join("");
+}
+
+async function loadToday() {
+  const d = await getJSON(DAILY + "?now=" + encodeURIComponent(localIso()));
+  if (d.error || d.current_balance == null) {
+    today = null;
+    document.getElementById("heart").innerHTML = '<div class="muted">Waiting for the first snapshot…</div>';
+    return;
+  }
+  today = d;
+  cur = d.currency || "";
+  document.getElementById("legCur").textContent = cur || "currency";
+  document.getElementById("legMinor").textContent = minorUnit(cur);
+  renderToday(d);
+  renderSummary(d);
+  const t = new Date(d.current_ts);
+  document.getElementById("meta").textContent =
+    "Updated " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+    " · " + t.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// ---- charts --------------------------------------------------------------
+
+function axisNum(v) {
+  if (v >= 100) return Math.round(v).toLocaleString();
+  if (v >= 10) return String(Math.round(v * 10) / 10);
+  return String(Math.round(v * 100) / 100);
+}
+function axisDur(v) {
+  const m = Math.round(v);
+  if (m < 60) return m + "m";
+  const h = m / 60;
+  return (Math.round(h * 10) / 10) + "h";
+}
+
 function niceStep(raw) {
   if (!(raw > 0)) return 1;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -492,164 +443,133 @@ function niceStep(raw) {
   return s * mag;
 }
 
-let cur = "";
-let today = null;            // full /balance/daily doc; drives the projected "today" bar
-const state = { days: 14 };
+// items: [{date, v (nullable), isToday}] — bar slot kept even when v==null so
+// all three charts share the same x-axis spacing.
+function renderBar(containerId, items, cfg) {
+  const host = document.getElementById(containerId);
+  const vals = items.map(it => it.v).filter(v => v != null);
+  if (!vals.length) { host.innerHTML = '<div class="muted">No data in this range.</div>'; return; }
+  const maxV = Math.max.apply(null, vals) || 1;
+  const step = niceStep(maxV / 4);
+  const top = Math.ceil(maxV / step) * step;
 
-async function getJSON(url) {
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
-}
+  const n = items.length;
+  const padL = 44, padR = 6, padT = 8, padB = 22;
+  const plotW = Math.max(240, n * 30);        // logical width; scales to container, no scroll
+  const plotH = 150, height = plotH + padT + padB, width = plotW + padL + padR;
+  const slot = plotW / n;
+  const barW = Math.max(2, Math.min(slot * 0.6, 26));
+  const y = (v) => padT + plotH * (1 - v / top);
 
-async function loadCards() {
-  const d = await getJSON(DAILY + "?now=" + encodeURIComponent(localIso()));
-  if (d.error || d.current_balance == null) {
-    today = null;
-    document.getElementById("sSpent").textContent = "waiting for first snapshot";
-    return;
+  let s = '<svg viewBox="0 0 ' + width + ' ' + height + '" xmlns="http://www.w3.org/2000/svg">';
+  for (let k = 0; k <= 4; k++) {
+    const vv = top * k / 4;
+    const gy = y(vv);
+    s += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (width - padR) + '" y2="' + gy +
+      '" stroke="rgba(148,163,184,.12)"' + (k === 0 ? ' stroke-width="1.3"' : "") + "/>";
+    s += '<text x="' + (padL - 5) + '" y="' + (gy + 3) + '" text-anchor="end" fill="#94a3b8" font-size="9">' +
+      cfg.yFmt(top * k / 4) + "</text>";
   }
-  today = d;
-  cur = d.currency || "";
-  document.getElementById("legCur").textContent = cur || "currency";
-  const ss = d.spend_summary || {};
-  const useMin = ss.usage_minutes || 0;
-  const cpm = d.spent_today != null && useMin > 0 ? d.spent_today / useMin : null;
-  document.getElementById("cSpent").textContent = fmt(d.spent_today, cur);
-  document.getElementById("sSpent").textContent = "usage " + fmtDur(useMin) + " · " + fmtCpm(cpm, cur);
-  document.getElementById("cBal").textContent = fmt(d.current_balance, cur);
-  const t = new Date(d.current_ts);
-  document.getElementById("sBal").textContent = "updated " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
-    " · projected " + fmt(d.projected_spend, cur) + " today";
-  document.getElementById("sub").textContent =
-    "Today's numbers (left cards) refresh live. On the chart, today's bar is the projected full-day spend — hatched to show it's an estimate, not history.";
-}
-
-function svgText(x, y, str, anchor, fill, size) {
-  return '<text x="' + x + '" y="' + y + '" text-anchor="' + (anchor || "middle") + '" fill="' + (fill || "#94a3b8") + '" font-size="' + (size || 10) + '">' + str + "</text>";
-}
-
-// Today as a *projected* bar: spend is the full-day projection (annualised
-// from the current pace), usage is the partial actual so far. Returns null
-// when there's no live data yet, so the chart then shows complete days only.
-function todayPoint() {
-  if (!today || today.current_balance == null) return null;
-  const useMin = (today.spend_summary || {}).usage_minutes || 0;
-  const proj = today.projected_spend;
-  const spent = today.spent_today;
-  if (proj == null && spent == null) return null;
-  const isProj = proj != null;
-  const spendVal = isProj ? proj : spent;
-  const cpm = spent != null && useMin > 0 ? spent / useMin : null;
-  const date = today.start_of_day ? today.start_of_day.slice(0, 10) : "";
-  return {
-    date: date,
-    spend: spendVal,
-    usage_minutes: useMin,
-    intervals_with_spend: 0,
-    cost_per_minute: cpm,
-    is_today: true,
-    projected: isProj,
-  };
-}
-
-function renderChart(data) {
-  const box = document.getElementById("chartwrap");
-  const hist = (data && data.days) || [];          // complete days (excl today)
-  const tday = todayPoint();                        // projected today (or null)
-  const days = tday ? hist.concat([tday]) : hist;   // drawn series incl today
-  if (!days.length) {
-    box.innerHTML = '<div class="muted">No day data yet — check back after a little usage.</div>';
-    return;
-  }
-
-  const spendMax = Math.max.apply(null, days.map(d => d.spend)) || 1;
-  const useMax = Math.max.apply(null, days.map(d => d.usage_minutes)) || 1;
-  const stepL = niceStep(spendMax / 4), topL = Math.ceil(spendMax / stepL) * stepL;
-  const stepR = niceStep(useMax / 4), topR = Math.ceil(useMax / stepR) * stepR;
-
-  const n = days.length;
-  const padL = 46, padR = 52, padT = 8, padB = 28;
-  const slot = n <= 15 ? 40 : n <= 32 ? 28 : Math.max(13, Math.min(22, 2400 / n));
-  const width = n * slot + padL + padR;
-  const plotH = 220, height = plotH + padT + padB;
-  const barW = Math.min(slot * 0.36, 34);
-  const y = (frac) => padT + plotH * (1 - frac);
-
-  let s = '<svg viewBox="0 0 ' + width + ' ' + height + '" width="100%" style="min-width:' + width + 'px">';
-  const steps = 4;
-  for (let k = 0; k <= steps; k++) {
-    const f = k / steps;
-    const gy = y(f);
-    s += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (width - padR) + '" y2="' + gy + '" stroke="rgba(148,163,184,.12)"' + (k === 0 ? ' stroke-width="1.2"' : "") + "/>";
-    const leftV = topL * f;
-    s += svgText(padL - 6, gy + 3, leftV.toLocaleString(undefined, { maximumFractionDigits: 0 }), "end", "#94a3b8");
-    const rightV = topR * f;
-    s += svgText(width - padR + 6, gy + 3, fmtRight(rightV), "start", "#a78bfa");
-  }
-
-  const labelEvery = Math.max(1, Math.ceil(n / 14));
+  const labelEvery = Math.max(1, Math.ceil(n / 9));
   for (let i = 0; i < n; i++) {
-    const d = days[i];
-    const isT = !!d.is_today;
+    const it = items[i];
     const cx = padL + i * slot + slot / 2;
-    const sf = d.spend / topL, uf = d.usage_minutes / topR;
-    const hS = sf * plotH, hU = uf * plotH;
-    const xS = cx - barW - 1.5, xU = cx + 1.5;
-    const xS2 = xS.toFixed(1), yS2 = y(sf).toFixed(1), hS2 = hS.toFixed(1);
-    const xU2 = xU.toFixed(1), yU2 = y(uf).toFixed(1), hU2 = hU.toFixed(1);
-    const titleS = d.date + (isT ? " (today — projected)" : "") + " spend " + fmtMoney(d.spend, cur) +
-      (d.cost_per_minute != null ? " · " + fmtCpm(d.cost_per_minute, cur) : "");
-    const titleU = d.date + (isT ? " (today — so far)" : "") + " usage " + fmtDur(d.usage_minutes);
-
-    if (isT) {
-      // Historical days: solid fill. Today: translucent + dashed outline so it
-      // reads as an estimate, plus a divider to set it apart.
-      s += '<line x1="' + (cx - slot / 2 + 2).toFixed(1) + '" y1="' + padT + '" x2="' + (cx - slot / 2 + 2).toFixed(1) + '" y2="' + (padT + plotH) + '" stroke="rgba(125,211,252,.25)" stroke-dasharray="2 3"/>';
-      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="rgba(56,189,248,.20)" rx="1"><title>' + titleS + "</title></rect>";
-      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="none" stroke="#38bdf8" stroke-dasharray="4 3" rx="1"/>';
-      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="rgba(167,139,250,.20)" rx="1" opacity="0.9"><title>' + titleU + "</title></rect>";
-      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="none" stroke="#a78bfa" stroke-dasharray="4 3" rx="1" opacity="0.9"/>';
-      // Annotate it (always) so the estimate is unmistakable.
-      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 14).toFixed(1) + '" text-anchor="middle" fill="#7dd3fc" font-size="9">today</text>';
-      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 24).toFixed(1) + '" text-anchor="middle" fill="#67e8f9" font-size="8">' + (d.projected ? "~proj" : "so far") + "</text>";
-    } else {
-      s += '<rect x="' + xS2 + '" y="' + yS2 + '" width="' + barW + '" height="' + hS2 + '" fill="#38bdf8" rx="1"><title>' + titleS + "</title></rect>";
-      s += '<rect x="' + xU2 + '" y="' + yU2 + '" width="' + barW + '" height="' + hU2 + '" fill="#a78bfa" rx="1" opacity="0.85"><title>' + titleU + "</title></rect>";
-      if (i % labelEvery === 0) {
-        s += svgText(cx, height - 8, d.date.slice(5));
-      }
+    const x = cx - barW / 2;
+    if (it.v == null) { continue; }
+    const h = Math.max(it.v > 0 ? 1 : 0, (it.v / top) * plotH);
+    const yy = y(it.v);
+    let fill = cfg.color;
+    let extra = "";
+    if (it.isToday) {
+      fill = "rgba(0,0,0,0)";
+      extra = ' stroke="' + cfg.color + '" stroke-dasharray="4 3" stroke-width="1.4"';
+    }
+    s += '<rect x="' + x.toFixed(1) + '" y="' + yy.toFixed(1) + '" width="' + barW.toFixed(1) +
+      '" height="' + h.toFixed(1) + '" fill="' + fill + '"' + extra + ' rx="1"><title>' +
+      cfg.tip(it) + "</title></rect>";
+    if (it.isToday) {
+      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 12) + '" text-anchor="middle" fill="' +
+        cfg.color + '" font-size="9">today' + (it.proj ? " (~proj)" : "") + "</text>";
+    } else if (i % labelEvery === 0) {
+      s += '<text x="' + cx.toFixed(1) + '" y="' + (padT + plotH + 12) + '" text-anchor="middle" fill="#94a3b8" font-size="9">' +
+        it.date.slice(5) + "</text>";
     }
   }
   s += "</svg>";
-  box.innerHTML = s;
-
-  // Range summary cards always reflect *complete* days only (never the today
-  // projection), so "range spend" isn't inflated by an estimate.
-  const totSpend = hist.reduce((a, d) => a + d.spend, 0);
-  const totUse = hist.reduce((a, d) => a + d.usage_minutes, 0);
-  const daysWithUse = hist.filter(d => d.usage_minutes > 0);
-  const wCpm = totUse > 0 ? totSpend / totUse : null;
-  const wCpmPerDay = daysWithUse.length
-    ? daysWithUse.reduce((a, d) => a + d.cost_per_minute, 0) / daysWithUse.length : null;
-  const label = state.days === 0
-    ? (hist.length ? "since " + hist[0].date : "no complete days yet")
-    : "last " + hist.length + " complete days";
-  document.getElementById("cTotal").textContent = fmtMoney(totSpend, cur);
-  document.getElementById("sTotal").textContent = label;
-  document.getElementById("cUse").textContent = fmtDur(totUse);
-  document.getElementById("sUse").textContent = "≈ " + (totUse / 60).toFixed(1) + "h active across " + hist.length + " days";
-  document.getElementById("cCpm").textContent = fmtCpm(wCpm, cur);
-  document.getElementById("sCpm").textContent = "avg day " + fmtCpm(wCpmPerDay, cur) + " · hover bars for daily";
+  host.innerHTML = s;
 }
 
-async function loadChart() {
-  try {
-    const data = await getJSON(DAYS + "?days=" + state.days + "&now=" + encodeURIComponent(localIso()));
-    renderChart(data);
-  } catch (e) {
-    document.getElementById("chartwrap").innerHTML = '<div class="err">Failed to load history: ' + e.message + "</div>";
+// Build per-day series with today's projected bar appended. Returns {items, label}
+function buildSpend(hist, tday) {
+  const items = hist.map(d => ({ date: d.date, v: d.spend, isToday: false }));
+  if (tday) items.push({ date: tday.date, v: tday.spend, isToday: true, proj: tday.proj });
+  return items;
+}
+function buildUsage(hist, tday) {
+  const items = hist.map(d => ({ date: d.date, v: d.usage_minutes, isToday: false }));
+  if (tday) items.push({ date: tday.date, v: tday.usage_minutes, isToday: true });
+  return items;
+}
+function buildCost(hist, tday, scale) {
+  // scale = minor units per base unit (100). cost/hr * scale, integer.
+  const items = hist.map(d => {
+    const v = d.usage_minutes > 0 ? (d.spend * 60 / d.usage_minutes) * scale : null;
+    return { date: d.date, v: v, isToday: false };
+  });
+  if (tday && tday.usage_minutes > 0 && tday.spent != null) {
+    items.push({ date: tday.date, v: (tday.spent * 60 / tday.usage_minutes) * scale, isToday: true, proj: true });
   }
+  return items;
+}
+
+function renderCharts(series) {
+  const hist = (series && series.days) || [];
+  const tday = !today ? null : {
+    date: (today.start_of_day || "").slice(0, 10),
+    spend: today.projected_spend != null ? today.projected_spend : (today.spent_today || 0),
+    proj: today.projected_spend != null,
+    usage_minutes: (today.spend_summary || {}).usage_minutes || 0,
+    spent: today.spent_today != null ? today.spent_today : 0,
+  };
+  const SCALE = 100; // cents / minor units per base unit
+
+  renderBar("cSpend", buildSpend(hist, tday), {
+    color: "#38bdf8",
+    yFmt: axisNum,
+    tip: it => (it.isToday ? "today (projected) · " : it.date + " · ") + "spend " + fmtMoney(it.v, cur),
+  });
+  renderBar("cUsage", buildUsage(hist, tday), {
+    color: "#a78bfa",
+    yFmt: axisDur,
+    tip: it => (it.isToday ? "today (so far) · " : it.date + " · ") + "usage " + fmtDur(it.v),
+  });
+  renderBar("cCost", buildCost(hist, tday, SCALE), {
+    color: "#f472b6",
+    yFmt: v => fmtMinorInt(v),
+    tip: it => (it.isToday ? "today (so far) · " : it.date + " · ") + (it.v != null ? fmtMinorInt(it.v) + " " + minorUnit(cur) + "/h" : "—"),
+  });
+
+  // average chips over complete days only (never the today estimate)
+  const done = hist.filter(d => d.spend > 0 || d.usage_minutes > 0);
+  if (!done.length) {
+    document.getElementById("avgline").innerHTML = '<span class="muted">No complete days of history yet — the bar is today’s projection.</span>';
+    return;
+  }
+  const n = done.length;
+  const avgSpend = done.reduce((a, d) => a + d.spend, 0) / n;
+  const avgUse = done.reduce((a, d) => a + d.usage_minutes, 0) / n;
+  const spendTot = done.reduce((a, d) => a + d.spend, 0);
+  const useTot = done.reduce((a, d) => a + d.usage_minutes, 0);
+  const cph = useTot > 0 ? (spendTot * 60 / useTot) * SCALE : null;
+  const label = state.days === 0 ? "all time since " + hist[0].date : "last " + n + " complete day" + (n === 1 ? "" : "s");
+  document.getElementById("avgline").innerHTML =
+    "<b>" + label + "</b> · avg spend/day <b>" + fmtMoney(avgSpend, cur) + "</b> · avg usage/day <b>" + fmtDur(avgUse) +
+    "</b> · avg cost " + fmtMinorInt(cph) + " " + minorUnit(cur) + "/h";
+}
+
+async function loadCharts() {
+  const series = await getJSON(DAYS + "?days=" + state.days + "&now=" + encodeURIComponent(localIso()));
+  renderCharts(series);
 }
 
 document.getElementById("range").addEventListener("click", (ev) => {
@@ -658,17 +578,17 @@ document.getElementById("range").addEventListener("click", (ev) => {
   state.days = RANGES[btn.dataset.days];
   document.querySelectorAll("#range button").forEach(b => b.classList.remove("on"));
   btn.classList.add("on");
-  loadChart();
+  loadCharts().catch(e => { document.getElementById("avgline").innerHTML = '<span class="err">' + e.message + "</span>"; });
 });
 
-// Load today first so the chart can draw the projected today bar on first paint.
 async function initAll() {
-  try { await loadCards(); }
-  catch (e) { document.getElementById("sSpent").textContent = "failed to load: " + e.message; }
-  await loadChart();
+  try { await loadToday(); }
+  catch (e) { document.getElementById("heart").innerHTML = '<div class="err">Failed to load: ' + e.message + "</div>"; }
+  loadCharts().catch(e => { document.getElementById("avgline").innerHTML = '<span class="err">' + e.message + "</span>"; });
 }
 initAll();
 </script>
 </body>
 </html>
 """
+
