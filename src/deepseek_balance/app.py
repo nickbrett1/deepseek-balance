@@ -501,8 +501,17 @@ load();
   if (window.parent === window) return;
   function reportHeight() {
     try {
-      var h = Math.ceil(document.documentElement.scrollHeight);
-      window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+      // Measure the real content, NOT the document root. Once the Homepage
+      // parent stretches this iframe taller than the page,
+      // documentElement.scrollHeight stops reporting our content and instead
+      // tracks the iframe's own (ever-taller) height -- a feedback loop that
+      // grows the card a little more on every cycle. <body> has no
+      // height/min-height, so its offsetHeight is the actual content height
+      // and stays constant.
+      var h = Math.ceil(document.body ? document.body.offsetHeight : 0);
+      if (h > 0) {
+        window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+      }
     } catch (e) {}
   }
   if (document.readyState === 'complete') { reportHeight(); }
@@ -986,8 +995,17 @@ initAll();
   if (window.parent === window) return;
   function reportHeight() {
     try {
-      var h = Math.ceil(document.documentElement.scrollHeight);
-      window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+      // Measure the real content, NOT the document root. Once the Homepage
+      // parent stretches this iframe taller than the page,
+      // documentElement.scrollHeight stops reporting our content and instead
+      // tracks the iframe's own (ever-taller) height -- a feedback loop that
+      // grows the card a little more on every cycle. <body> has no
+      // height/min-height, so its offsetHeight is the actual content height
+      // and stays constant.
+      var h = Math.ceil(document.body ? document.body.offsetHeight : 0);
+      if (h > 0) {
+        window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+      }
     } catch (e) {}
   }
   if (document.readyState === 'complete') { reportHeight(); }
