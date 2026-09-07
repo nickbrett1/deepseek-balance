@@ -56,12 +56,30 @@ def _minutes_between(a: str, b: str) -> float | None:
         return None
 
 
+def _row_iso(row: dict) -> str:
+    """Canonical ISO time of a snapshot: its scheduled grid slot when known.
+
+    Polls stamp ``scheduled_ts`` as the wall-clock boundary (:00/:05/...) the
+    snapshot was meant to cover; ``ts`` is the few-seconds-later completion
+    time. Reconciliation keys off the *scheduled* boundary so completion jitter
+    never masquerades as cadence drift. Legacy rows (no scheduled_ts) fall back
+    to ``ts``.
+    """
+    return row.get("scheduled_ts") or row["ts"]
+
+
+def _row_time(row: dict) -> datetime:
+    """Aware datetime version of :func:`_row_iso`."""
+    return datetime.fromisoformat(_row_iso(row))
+
+
 def _collect_drops(rows: list[dict], max_gap_minutes: int) -> list[tuple[datetime, float]]:
     """Per-interval balance declines from a chronological row list.
 
-    Each decline is attributed to the timestamp of the snapshot it ended in
-    and only counts when the gap between snapshots is sane (<= max_gap_minutes)
-    so that downtime gaps don't masquerade as a single big spend.
+    Each decline is attributed to the boundary of the snapshot it ended in
+    (its scheduled grid slot, not completion time) and only counts when the gap
+    between consecutive poll boundaries is sane (<= max_gap_minutes) so that
+    downtime gaps don't masquerade as a single big spend.
     """
     drops: list[tuple[datetime, float]] = []
     for i in range(1, len(rows)):
@@ -69,12 +87,12 @@ def _collect_drops(rows: list[dict], max_gap_minutes: int) -> list[tuple[datetim
         cur = rows[i]
         if prev["total_balance"] is None or cur["total_balance"] is None:
             continue
-        gap_min = _minutes_between(prev["ts"], cur["ts"])
+        gap_min = _minutes_between(_row_iso(prev), _row_iso(cur))
         if gap_min is None or gap_min > max_gap_minutes:
             continue
         drop = prev["total_balance"] - cur["total_balance"]
         if drop > 0:
-            drops.append((datetime.fromisoformat(cur["ts"]), drop))
+            drops.append((_row_time(cur), drop))
     return drops
 
 
@@ -188,7 +206,7 @@ def daily_history_series(
     parsed: list[tuple[datetime, float | None]] = []
     for r in rows:
         try:
-            parsed.append((datetime.fromisoformat(r["ts"]), r["total_balance"]))
+            parsed.append((_row_time(r), r["total_balance"]))
         except ValueError:
             continue
 
@@ -477,7 +495,7 @@ def daily_heartbeat(
         cur = recent[i]
         if prev["total_balance"] is None or cur["total_balance"] is None:
             continue
-        gap_min = _minutes_between(prev["ts"], cur["ts"])
+        gap_min = _minutes_between(_row_iso(prev), _row_iso(cur))
         if gap_min is None or gap_min > max_gap_minutes:
             continue
         drop = prev["total_balance"] - cur["total_balance"]
@@ -485,8 +503,8 @@ def daily_heartbeat(
             continue
         drops.append(
             {
-                "from_ts": prev["ts"],
-                "to_ts": cur["ts"],
+                "from_ts": _row_iso(prev),
+                "to_ts": _row_iso(cur),
                 "drop": drop,
                 "pct": drop / prev["total_balance"],
                 "gap_minutes": gap_min,

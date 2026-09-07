@@ -20,7 +20,8 @@ from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS balance_snapshots (
-  ts TEXT PRIMARY KEY,            -- ISO8601 UTC
+  ts TEXT PRIMARY KEY,            -- ISO8601 UTC, completion time
+  scheduled_ts TEXT,              -- ISO8601 UTC grid slot the poll was meant for (NULL on legacy rows)
   currency TEXT,
   total_balance REAL,
   granted_balance REAL,
@@ -86,11 +87,23 @@ class BalanceDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring existing DBs up to date (CREATE IF NOT EXISTS won't add columns)."""
+        with self._lock:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(balance_snapshots)")}
+            if "scheduled_ts" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE balance_snapshots ADD COLUMN scheduled_ts TEXT"
+                )
+                self._conn.commit()
 
     def insert_snapshot(
         self,
         *,
         ts: str,
+        scheduled_ts: str | None = None,
         currency: str | None,
         total_balance: float | None,
         granted_balance: float | None,
@@ -104,10 +117,11 @@ class BalanceDB:
             self._conn.execute(
                 """
                 INSERT INTO balance_snapshots (
-                  ts, currency, total_balance, granted_balance,
+                  ts, scheduled_ts, currency, total_balance, granted_balance,
                   topped_up_balance, is_available, http_status, raw
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ts) DO UPDATE SET
+                  scheduled_ts=excluded.scheduled_ts,
                   currency=excluded.currency,
                   total_balance=excluded.total_balance,
                   granted_balance=excluded.granted_balance,
@@ -118,6 +132,7 @@ class BalanceDB:
                 """,
                 (
                     ts,
+                    scheduled_ts,
                     currency,
                     total_balance,
                     granted_balance,
@@ -407,7 +422,7 @@ class BalanceDB:
         `since_iso` onwards.
         """
         sql = """
-            SELECT ts, total_balance, is_available, http_status
+            SELECT ts, scheduled_ts, total_balance, is_available, http_status
             FROM balance_snapshots
             WHERE ts >= ? AND total_balance IS NOT NULL
         """

@@ -56,13 +56,20 @@ raw balance trend chart. It answers three questions at a glance:
   `MIN_INTERVALS_FOR_BASELINE` spent intervals in the window, the widget says
   "not enough data" instead of guessing.
 
-The poller defaults to `POLL_INTERVAL=1m` (granular enough to notice a sudden
-single-interval decline). Tune the detection without touching code via these
+The poller defaults to `POLL_INTERVAL=5m`. Polls are anchored to the wall
+clock — a poll is held until the next `:00/:05/:10` boundary and then fires on
+it — rather than running on a free "interval since startup" cadence. Anchoring
+to the clock keeps consecutive poll deltas steady at exactly the period and
+keeps each 5-minute spend slice aligned with a poll boundary (the poller needs
+a boundary per slice so a drop is attributed to the slice it ended in, which
+is why the default `5m` matches the default `SPEND_SLICE_MINUTES=5`). A cron
+grid is used whenever the interval divides an hour; otherwise it falls back to
+an interval trigger. Tune the detection without touching code via these
 environment variables:
 
 | Env var                    | Default | Meaning                                        |
 | -------------------------- | ------- | ---------------------------------------------- |
-| `POLL_INTERVAL`            | `1m`    | Balance polling cadence (finer = catches faster drops). |
+| `POLL_INTERVAL`            | `5m`    | Balance polling cadence (finer = catches faster drops; grid-anchored). |
 | `MAX_GAP_MINUTES`          | `30`    | Skip comparing drops across gaps wider than this. |
 | `NORMAL_DAYS`              | `14`    | Days of history used for the "typical day" baseline. |
 | `SPEND_SLICE_MINUTES`      | `5`     | Width of each spend interval in the summary.   |

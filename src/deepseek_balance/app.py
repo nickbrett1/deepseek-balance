@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -28,7 +29,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 DEFAULT_PORT = 3000
 # Finer polling so the "daily heartbeat" can spot rapid single-interval drops.
-DEFAULT_INTERVAL = "1m"
+# Every slice (SPEND_SLICE_MINUTES) needs a poll boundary so a drop can be
+# attributed to the slice it ended in; 5m matches the default 5m slice.
+DEFAULT_INTERVAL = "5m"
+
+
+def _poll_trigger(interval_seconds: int):
+    """Wall-clock-anchored trigger so polls land exactly on the slice grid.
+
+    Polls should fire on round clock boundaries (:00/:05/:10…) rather than on
+    a free-running ``interval since the process started``. APScheduler's
+    ``CronTrigger`` *waits for the next boundary* and then recomputes the next
+    fire from the schedule (not from completion time), so a late or coalesced
+    tick never drifts the phase or opens an oversized gap. Any interval that
+    divides an hour evenly maps to a minute cron (1m→'*', 5m→'*/5', 15m→'*/15').
+    Periods that can't be expressed that way fall back to an IntervalTrigger.
+    """
+    if interval_seconds >= 60 and interval_seconds % 60 == 0:
+        minutes = interval_seconds // 60
+        if minutes <= 59 and 60 % minutes == 0:
+            minute = "*" if minutes == 1 else f"*/{minutes}"
+            return CronTrigger(minute=minute)
+    return IntervalTrigger(seconds=interval_seconds)
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -101,15 +123,16 @@ async def lifespan(app: FastAPI):
     db_path = _env("DB_PATH", "/data/deepseek.db")
     interval = _env("POLL_INTERVAL", DEFAULT_INTERVAL)
     api_key = _env("DEEPSEEK_API_KEY")
+    interval_seconds = parse_interval(interval)
 
     db = BalanceDB(db_path)
-    poller = BalancePoller(db=db, api_key=api_key)
-    interval_seconds = parse_interval(interval)
+    poller = BalancePoller(db=db, api_key=api_key, interval_seconds=interval_seconds)
+    trigger = _poll_trigger(interval_seconds)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         poller.poll_once,
-        trigger=IntervalTrigger(seconds=interval_seconds),
+        trigger=trigger,
         id="deepseek-balance-poll",
         max_instances=1,
         coalesce=True,

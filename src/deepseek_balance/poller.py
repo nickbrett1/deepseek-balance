@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -44,6 +44,19 @@ def parse_interval(value: str) -> int:
     return int(m.group(1)) * _UNIT_TO_SECONDS[m.group(2).lower()]
 
 
+def floor_interval(dt: datetime, seconds: int) -> datetime:
+    """Floor an aware datetime to the nearest UTC `seconds` grid boundary.
+
+    Used to derive the *scheduled* poll slot from the wall clock so a snapshot
+    can record which grid slot (e.g. the :00/:05/:10 boundary) it was meant to
+    cover, independently of the few seconds of HTTP + DB latency that push the
+    actual completion timestamp later.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    idx = int((dt - epoch).total_seconds() // seconds)
+    return epoch + timedelta(seconds=idx * seconds)
+
+
 class CircuitBreaker:
     """Tiny circuit breaker: open after N failures, auto-recovers after a window."""
 
@@ -71,11 +84,27 @@ class CircuitBreaker:
 
 
 class BalancePoller:
-    def __init__(self, db: BalanceDB, api_key: str | None, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        db: BalanceDB,
+        api_key: str | None,
+        client: httpx.Client | None = None,
+        *,
+        interval_seconds: int | None = None,
+    ) -> None:
         self.db = db
         self.api_key = api_key
         self.client = client or httpx.Client(timeout=30.0)
         self.breaker = CircuitBreaker()
+        # Grid width used to stamp each snapshot with the wall-clock slot it was
+        # scheduled for. None disables scheduled_ts recording.
+        self.interval_seconds = interval_seconds
+
+    def _scheduled_ts(self) -> str | None:
+        """ISO UTC slot boundary the current poll is scheduled to cover."""
+        if self.interval_seconds is None:
+            return None
+        return floor_interval(datetime.now(UTC), self.interval_seconds).isoformat()
 
     def poll_once(self) -> dict | None:
         """Run one poll cycle. Returns the snapshot dict that was stored (or None if skipped)."""
@@ -126,6 +155,7 @@ class BalancePoller:
             return self._gap_snapshot(raw_text, http_status=200, is_available=False)
         return {
             "ts": datetime.now(UTC).isoformat(),
+            "scheduled_ts": self._scheduled_ts(),
             "currency": info.get("currency"),
             "total_balance": _to_float(info.get("total_balance")),
             "granted_balance": _to_float(info.get("granted_balance")),
@@ -139,6 +169,7 @@ class BalancePoller:
         """An explicit 'gap' row: no balance, but records the failure."""
         return {
             "ts": datetime.now(UTC).isoformat(),
+            "scheduled_ts": self._scheduled_ts(),
             "currency": None,
             "total_balance": None,
             "granted_balance": None,
@@ -151,6 +182,7 @@ class BalancePoller:
     def _store(self, snapshot: dict) -> None:
         self.db.insert_snapshot(
             ts=snapshot["ts"],
+            scheduled_ts=snapshot.get("scheduled_ts"),
             currency=snapshot["currency"],
             total_balance=snapshot["total_balance"],
             granted_balance=snapshot["granted_balance"],
