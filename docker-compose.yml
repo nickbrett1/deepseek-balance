@@ -34,6 +34,14 @@ services:
       SPIKE_MIN_RATIO: ${SPIKE_MIN_RATIO:-2.0}
       MIN_INTERVALS_FOR_BASELINE: ${MIN_INTERVALS_FOR_BASELINE:-10}
       NORMAL_BAND: ${NORMAL_BAND:-2.0}
+      PHOENIX_BASE_URL: ${PHOENIX_BASE_URL:-http://phoenix:6006}
+      PHOENIX_PROJECT: ${PHOENIX_PROJECT:-default}
+      ANALYSIS_LOOKBACK_DAYS: ${ANALYSIS_LOOKBACK_DAYS:-3}
+      PHOENIX_WINDOW_PAD_SECONDS: ${PHOENIX_WINDOW_PAD_SECONDS:-60}
+      ANALYSIS_INTERVAL: ${ANALYSIS_INTERVAL:-10m}
+      MAX_DIAGNOSE_PER_RUN: ${MAX_DIAGNOSE_PER_RUN:-25}
+    networks:
+      - ai_proxy
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       - "homepage.group=Services"
@@ -62,3 +70,9 @@ services:
       MIN_INTERVALS_FOR_BASELINE: ${MIN_INTERVALS_FOR_BASELINE:-10}
       NORMAL_BAND: ${NORMAL_BAND:-2.0}
       MAX_GAP_MINUTES: ${MAX_GAP_MINUTES:-30}
+    networks:
+      - ai_proxy
+
+networks:
+  ai_proxy:
+    external: true

@@ -17,8 +17,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+from . import analysis as analysis_mod
 from . import analytics
 from .db import BalanceDB
+from .phoenix import client_from_env, is_configured
 from .poller import BalancePoller, parse_interval
 
 logger = logging.getLogger("deepseek_balance.app")
@@ -74,6 +76,26 @@ def _summary_kwargs() -> dict:
     }
 
 
+def _analysis_service(db: BalanceDB) -> analysis_mod.AnalysisService | None:
+    """Build the analysis service when Phoenix is configured, else None."""
+    if not is_configured():
+        return None
+    try:
+        phoenix = client_from_env()
+    except Exception as exc:  # noqa: BLE001 — fail soft so the app still runs
+        logger.warning("Phoenix client init failed: %s — analysis disabled", exc)
+        return None
+    return analysis_mod.AnalysisService(
+        db,
+        phoenix,
+        lookback_days=_int_env("ANALYSIS_LOOKBACK_DAYS", analysis_mod.DEFAULT_LOOKBACK_DAYS),
+        pad_seconds=_int_env("PHOENIX_WINDOW_PAD_SECONDS", analysis_mod.DEFAULT_PHOENIX_PAD_SECONDS),
+        max_diagnose_per_run=_int_env(
+            "MAX_DIAGNOSE_PER_RUN", analysis_mod.DEFAULT_MAX_DIAGNOSE_PER_RUN
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db_path = _env("DB_PATH", "/data/deepseek.db")
@@ -95,8 +117,33 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("poller started: every %s (%.0fs), db=%s", interval, interval_seconds, db_path)
 
+    # Optional "why was it high?" analysis: only when Phoenix is configured.
+    analysis_service = _analysis_service(db)
+    if analysis_service is not None:
+        analysis_seconds = parse_interval(_env("ANALYSIS_INTERVAL", "10m"))
+        scheduler.add_job(
+            analysis_service.run,
+            trigger=IntervalTrigger(seconds=analysis_seconds),
+            id="deepseek-balance-analysis",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "analysis job started: every %ss (phoenix=%s, lookback=%dd)",
+            analysis_seconds,
+            analysis_service.phoenix.base_url,
+            analysis_service.lookback_days,
+        )
+        # First pass on startup so the table has history to show right away.
+        try:
+            report = analysis_service.run()
+            logger.info("analysis backfill: %s", report)
+        except Exception as exc:  # noqa: BLE001 — never let a backfill failure kill startup
+            logger.warning("initial analysis backfill failed: %s", exc)
+
     app.state.db = db
     app.state.poller = poller
+    app.state.analysis = analysis_service
 
     try:
         yield
@@ -215,6 +262,75 @@ def spend_intervals_endpoint(
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return WIDGET_HTML
+
+
+def _analysis_rows(service, limit: int, before: str | None) -> tuple[list[dict], bool, str | None]:
+    """Query diagnosed/known high intervals, converted to server-local times.
+
+    Returns ``(rows, has_more, next_before)`` for the table paginator.
+    """
+    if service is None:
+        return [], False, None
+    rows, has_more = service.db.high_intervals_with_diagnostics(
+        limit=limit, before_utc=before
+    )
+    tz = datetime.now().astimezone().tzinfo
+    out: list[dict] = []
+    for r in rows:
+        def _to_local(iso: str) -> str:
+            try:
+                return datetime.fromisoformat(iso).astimezone(tz).isoformat()
+            except (TypeError, ValueError):
+                return iso
+        out.append(
+            {
+                "start_utc": r["start_utc"],
+                "end_utc": r["end_utc"],
+                "start_local": _to_local(r["start_utc"]),
+                "end_local": _to_local(r["end_utc"]),
+                "day": r["day"],
+                "slice_minutes": r["slice_minutes"],
+                "spend": r["spend"],
+                "diagnosis": r["diagnosis"],
+            }
+        )
+    next_before = out[-1]["start_utc"] if (has_more and out) else None
+    return out, has_more, next_before
+
+
+@app.get("/analysis/high-intervals")
+def analysis_high_intervals(limit: int = 15, before: str | None = None) -> dict:
+    """Table of unusually-high spend intervals with their Phoenix diagnosis.
+
+    Newest first. Pass ``before`` (a UTC interval-start from the previous page's
+    ``next_before``) to page back through older intervals. ``limit`` caps page
+    size (default 15). Times are given in both UTC and the server's local time.
+    """
+    limit = max(1, min(100, limit))
+    service: analysis_mod.AnalysisService | None = getattr(app.state, "analysis", None)
+    if service is None:
+        return {"configured": False, "timezone": None, "rows": [], "has_more": False}
+    rows, has_more, next_before = _analysis_rows(service, limit, before)
+    return {
+        "configured": True,
+        "timezone": datetime.now().astimezone().tzname(),
+        "rows": rows,
+        "has_more": has_more,
+        "next_before": next_before,
+    }
+
+
+@app.post("/analysis/backfill")
+def analysis_backfill() -> dict:
+    """Run one analysis pass now (detect highs + diagnose the new ones)."""
+    service: analysis_mod.AnalysisService | None = getattr(app.state, "analysis", None)
+    if service is None:
+        return {"error": "analysis not configured (set PHOENIX_BASE_URL)"}
+    try:
+        return service.run()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("manual analysis backfill failed: %s", exc)
+        return {"error": str(exc)}
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -427,6 +543,19 @@ HISTORY_HTML = """<!DOCTYPE html>
   .muted { opacity: .55; }
   svg text { font-family: ui-sans-serif, system-ui, sans-serif; }
   .todaycard { display:grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap:8px; }
+  table#ahi { width:100%; border-collapse:collapse; margin-top:4px; }
+  table#ahi th, table#ahi td { text-align:left; padding:5px 6px; border-bottom:1px solid rgba(148,163,184,.12); font-size:12px; vertical-align:top; }
+  table#ahi th { text-transform:uppercase; letter-spacing:.04em; font-size:10px; opacity:.6; font-weight:600; white-space:nowrap; }
+  table#ahi td.num, table#ahi th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  table#ahi td.when { white-space:nowrap; color:#cbd5e1; font-variant-numeric:tabular-nums; }
+  .chip { display:inline-block; font-size:10px; font-weight:600; padding:1px 7px; border-radius:999px; white-space:nowrap; }
+  .chip.act { background:rgba(251,146,60,.15); color:#fdba74; }
+  .chip.inv { background:rgba(248,113,113,.18); color:#fca5a5; }
+  .chip.ok { background:rgba(52,211,153,.15); color:#6ee7b7; }
+  .chip.pend { background:rgba(148,163,184,.15); color:#94a3b8; }
+  table#ahi td.summary { max-width:420px; }
+  table#ahi td.summary b { color:#e2e8f0; }
+  table#ahi td.summary div { opacity:.75; }
 </style>
 </head>
 <body>
@@ -461,6 +590,18 @@ HISTORY_HTML = """<!DOCTYPE html>
     <h3>Cost per hour <span style="font-weight:400;opacity:.7">(in <span id="legMinor">¢</span>/hour)</span></h3>
     <div class="note">Spend ÷ active hours. Lower = cheaper use. Blank days had no usage.</div>
     <div id="cCost"></div>
+  </div>
+
+  <div class="section-title">Why were recent intervals unusually high?</div>
+  <div id="anote" class="muted" style="margin-bottom:6px">Loading…</div>
+  <table id="ahi">
+    <thead><tr>
+      <th>Interval</th><th>Spend</th><th>Req</th><th>Cache</th><th>Diagnosis</th><th>Status</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="seg" id="ahiPage" style="margin-top:8px">
+    <button id="ahiBack" disabled>← Older</button>
   </div>
 
 <script>
@@ -743,10 +884,86 @@ document.getElementById("range").addEventListener("click", (ev) => {
   loadCharts().catch(e => { document.getElementById("avgline").innerHTML = '<span class="err">' + e.message + "</span>"; });
 });
 
+// ---- "why was it high?" analysis table -----------------------------------
+
+const anote = document.getElementById("anote");
+let ahiBefore = null;          // UTC cursor for paging to older intervals
+
+function chipFor(diag) {
+  if (!diag) return '<span class="chip pend">analysing</span>';
+  if (diag.investigate) return '<span class="chip inv">investigate</span>';
+  if (diag.actionable) return '<span class="chip act">actionable</span>';
+  return '<span class="chip ok">fine</span>';
+}
+
+function whenCell(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
+    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function cacheCell(diag) {
+  if (!diag || diag.cache_hit_ratio == null) return "—";
+  return Math.round(diag.cache_hit_ratio * 100) + "%";
+}
+function costHint(diag) {
+  if (!diag) return "—";
+  if (diag.explained_cost_pct == null) return "n/a";
+  return Math.round(diag.explained_cost_pct) + "%";
+}
+
+function renderAnalysis(d) {
+  const tbody = document.querySelector("#ahi tbody");
+  if (!d.rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">No unusually-high intervals analysed yet. '
+      + (d.configured ? "Run <code>/analysis/backfill</code> after a heavy period." : "Analysis is disabled (no PHOENIX_BASE_URL).") + "</td></tr>";
+    anote.textContent = d.configured ? "" : "Set PHOENIX_BASE_URL to enable the Phoenix deep-dive.";
+    return;
+  }
+  tbody.innerHTML = d.rows.map(r => {
+    const diag = r.diagnosis;
+    const label = diag ? '<b>' + (diag.reason_label || diag.reason) + "</b>" : "analysis pending";
+    const sub = diag ? (diag.summary || "") : "Awaiting the next analysis pass.";
+    return "<tr>" +
+      '<td class="when">' + whenCell(r.start_local) + "</td>" +
+      '<td class="num">' + fmtMoney(r.spend, cur) + "</td>" +
+      '<td class="num">' + (diag ? diag.request_count : "—") + "</td>" +
+      '<td class="num">' + cacheCell(diag) + "</td>" +
+      '<td class="summary">' + label + "<div>" + sub + "</div></td>" +
+      '<td>' + chipFor(diag) + "</td>" +
+      "</tr>";
+  }).join("");
+  anote.textContent = d.has_more ? "Showing the most recent intervals." : "";
+  const back = document.getElementById("ahiBack");
+  back.disabled = !d.has_more;
+  ahiBefore = d.next_before || null;   // cursor for paging further back
+}
+
+async function loadAnalysis() {
+  try {
+    let url = "/analysis/high-intervals?limit=15";
+    if (ahiBefore) url += "&before=" + encodeURIComponent(ahiBefore);
+    const d = await getJSON(url);
+    renderAnalysis(d);
+  } catch (e) {
+    anote.innerHTML = '<span class="err">Analysis failed to load: ' + e.message + "</span>";
+  }
+}
+
+document.getElementById("ahiBack").addEventListener("click", () => {
+  if (!ahiBefore) return;
+  loadAnalysis();
+});
+
 async function initAll() {
   try { await loadToday(); }
   catch (e) { document.getElementById("heart").innerHTML = '<div class="err">Failed to load: ' + e.message + "</div>"; }
   loadCharts().catch(e => { document.getElementById("avgline").innerHTML = '<span class="err">' + e.message + "</span>"; });
+  // The analysis table loads last; when its data arrives we set the page cursor.
+  getJSON("/analysis/high-intervals?limit=15").then(d => {
+    ahiBefore = d.next_before || null;
+    renderAnalysis(d);
+  }).catch(e => { anote.innerHTML = '<span class="err">' + e.message + "</span>"; });
 }
 initAll();
 </script>

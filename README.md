@@ -187,6 +187,39 @@ unset DOPPLER_PROJECT DOPPLER_CONFIG DOPPLER_ENVIRONMENT
 doppler setup --no-interactive --project common --config dev
 ```
 
+### "Why was it high?" analysis (Phoenix deep-dive)
+
+When a spend interval is flagged **unusually high**, the app asks Arize Phoenix
+what drove it and shows the answer in a table at the bottom of the `/history`
+drill-in. Phoenix runs on the `ai_proxy` Docker network; the app must be on that
+network and pointed at it:
+
+| Env var                  | Default                     | Meaning |
+| ------------------------ | --------------------------- | ------- |
+| `PHOENIX_BASE_URL`       | (unset = analysis disabled) | Phoenix REST base, e.g. `http://phoenix:6006`. |
+| `PHOENIX_PROJECT`        | `default`                   | Phoenix project holding the LiteLLM/deepseek spans. |
+| `ANALYSIS_LOOKBACK_DAYS` | `3`                         | Complete days back to detect high intervals for. |
+| `PHOENIX_WINDOW_PAD_SECONDS` | `60`                    | Widen each interval when querying Phoenix (traces bound on start). |
+| `ANALYSIS_INTERVAL`      | `10m`                       | Analysis job cadence (APScheduler). |
+| `MAX_DIAGNOSE_PER_RUN`   | `25`                        | Cap on Phoenix dives per pass (bounds query volume). |
+
+Detection reuses the same robust-MAD spike rule (`analytics.spend_intervals`)
+over recent complete days in the **server's local timezone**, recording each
+flagged interval once. For each it pulls LLM spans over the window and classifies
+the cause with a deterministic, ordered heuristic (`heuristics.py`): it first
+reconciles Σ `litellm.cost.total` against the interval's balance drop (both USD)
+and, if the traces can't account for the spend, flags the interval
+`unexplained → investigate` rather than inventing a cause. Actionable reasons
+include tool-call loops, bloated (cache-miss) contexts, a single dominant
+request, errors/retries, and high-concurrency cache misses; well-cached high
+activity is marked benign (not an optimisation candidate).
+
+Endpoints: `GET /analysis/high-intervals` (paged table, newest first, `before`
+cursor for paging back) and `POST /analysis/backfill` (run a pass on demand).
+A startup + periodic backfill keeps the table populated once Phoenix is
+reachable. `POST /analysis/backfill` is the fastest way to get a first table to
+sanity-check the heuristics.
+
 ## Deployment
 
 See `deploy/README.md` for the deployment runbook (CircleCI -> GHCR ->
