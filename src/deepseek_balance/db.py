@@ -253,6 +253,67 @@ class BalanceDB:
             )
         return out, has_more
 
+    def high_intervals_detailed(
+        self,
+        *,
+        limit: int = 500,
+        include_signals: bool = True,
+    ) -> list[dict]:
+        """Diagnosed high intervals (newest first) with the full stored
+        diagnosis, optionally including the raw signals payload that the
+        heuristics kept for tuning and deeper inspection.
+
+        Unlike high_intervals_with_diagnostics, which drives the compact table
+        and returns only display fields, this returns the complete diagnostic
+        row, which is what an agent investigating an interval wants.
+        """
+        sql = (
+            "SELECT h.*, d.* FROM high_intervals h "
+            "INNER JOIN interval_diagnostics d ON d.start_utc = h.start_utc "
+            "ORDER BY h.start_utc DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, (limit,)).fetchall()
+
+        out = []
+        for r in rows:
+            r = dict(r)
+            signals = None
+            if include_signals:
+                payload = r.pop("payload", None)
+                if payload:
+                    signals = (json.loads(payload) or {}).get("signals")
+            out.append(
+                {
+                    "start_utc": r["start_utc"],
+                    "end_utc": r["end_utc"],
+                    "slice_minutes": r["slice_minutes"],
+                    "spend": r["spend"],
+                    "day": r["day"],
+                    "diagnosis": {
+                        "reason": r["reason"],
+                        "reason_label": r["reason_label"],
+                        "actionable": bool(r["actionable"]),
+                        "investigate": bool(r["investigate"]),
+                        "window_spend": r["window_spend"],
+                        "reconciled_cost": r["reconciled_cost"],
+                        "explained_cost_pct": r["explained_cost_pct"],
+                        "request_count": r["request_count"],
+                        "cache_read_tokens": r["cache_read_tokens"],
+                        "uncached_input_tokens": r["uncached_input_tokens"],
+                        "output_tokens": r["output_tokens"],
+                        "cache_hit_ratio": r["cache_hit_ratio"],
+                        "error_count": r["error_count"],
+                        "tool_call_count": r["tool_call_count"],
+                        "top_models": json.loads(r["top_models"] or "[]"),
+                        "summary": r["summary"],
+                        "analyzed_at": r["analyzed_at"],
+                        "signals": signals,
+                    },
+                }
+            )
+        return out
+
     # --- diagnostics ------------------------------------------------------------
 
     def upsert_diagnostic(self, *, start_utc: str, diag: dict) -> None:

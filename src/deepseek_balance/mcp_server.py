@@ -106,7 +106,11 @@ server = MCPServer(
         "daily summary of today's spend, use `today_summary` first. Otherwise "
         "use `spend_summary` for aggregate counts over the last N hours and "
         "`list_spend_intervals` for individual periods, optionally filtered by "
-        "`bucket` ('high' | 'normal' | 'below')."
+        "`bucket` ('high' | 'normal' | 'below'). When following up on a heavy "
+        "period, use `high_interval_diagnoses` to see why unusually-high "
+        "intervals were flagged (Phoenix-trace reasons: actionable candidates, "
+        "benign well-cached activity, or 'investigate' where the spend wasn't "
+        "explained)."
     ),
 )
 
@@ -177,6 +181,92 @@ def list_spend_intervals(
         "thresholds": si["thresholds"],
         "summary": si["summary"],
         "intervals": intervals,
+    }
+
+
+@server.tool()
+def high_interval_diagnoses(
+    limit: int = 15,
+    status: str = "all",
+    reason: str | None = None,
+    include_signals: bool = False,
+) -> dict:
+    """List unusually-high spend intervals with their Phoenix-trace diagnosis.
+
+    This is the "why was it high?" view an agent should read when it wants to
+    follow up on a heavy period: each entry is one high spend interval plus the
+    heuristic reason the Phoenix dive produced. `status` narrows to actionable
+    (real optimisation candidates), investigate (spend Phoenix couldn't
+    explain), benign (well-cached high activity - not candidates), or pending
+    (recorded but not yet analysed). Pass `reason` to filter by the exact
+    reason key (e.g. 'bloated_context', 'tool_call_loop'). Set
+    `include_signals` to add the raw per-window token/cost signals for deep
+    investigation. Timestamps are given in both UTC and the server's local
+    timezone (`timezone`).
+    """
+    if status not in ("all", "actionable", "investigate", "benign", "pending"):
+        raise ValueError("status must be one of: all, actionable, investigate, benign, pending")
+    limit = max(1, min(100, limit))
+    rows = get_db().high_intervals_detailed(limit=500, include_signals=include_signals)
+
+    filtered = []
+    for r in rows:
+        diag = r["diagnosis"]
+        if status == "actionable" and not (diag and diag["actionable"]):
+            continue
+        if status == "investigate" and not (diag and diag["investigate"]):
+            continue
+        if status == "benign" and not (diag and not diag["actionable"] and not diag["investigate"]):
+            continue
+        if status == "pending" and diag is not None:
+            continue
+        if reason and not (diag and diag["reason"] == reason):
+            continue
+        filtered.append(r)
+
+    entries = []
+    for r in filtered[:limit]:
+        diag = r["diagnosis"]
+        entry = {
+            "start_utc": r["start_utc"],
+            "start": _to_local(r["start_utc"]),
+            "end_utc": r["end_utc"],
+            "end": _to_local(r["end_utc"]),
+            "day": r["day"],
+            "slice_minutes": r["slice_minutes"],
+            "spend": r["spend"],
+        }
+        if diag is not None:
+            entry.update(
+                {
+                    "reason": diag["reason"],
+                    "reason_label": diag["reason_label"],
+                    "actionable": diag["actionable"],
+                    "investigate": diag["investigate"],
+                    "summary": diag["summary"],
+                    "reconciled_cost": diag["reconciled_cost"],
+                    "explained_cost_pct": diag["explained_cost_pct"],
+                    "request_count": diag["request_count"],
+                    "cache_read_tokens": diag["cache_read_tokens"],
+                    "uncached_input_tokens": diag["uncached_input_tokens"],
+                    "output_tokens": diag["output_tokens"],
+                    "cache_hit_ratio": diag["cache_hit_ratio"],
+                    "error_count": diag["error_count"],
+                    "tool_call_count": diag["tool_call_count"],
+                    "top_models": diag["top_models"],
+                    "analyzed_at": diag["analyzed_at"],
+                }
+            )
+            if include_signals and diag.get("signals") is not None:
+                entry["signals"] = diag["signals"]
+        entries.append(entry)
+
+    return {
+        "timezone": _tz_name(),
+        "local_now": _local_now().isoformat(),
+        "status": status,
+        "count": len(entries),
+        "intervals": entries,
     }
 
 

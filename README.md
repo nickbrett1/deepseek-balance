@@ -220,6 +220,11 @@ A startup + periodic backfill keeps the table populated once Phoenix is
 reachable. `POST /analysis/backfill` is the fastest way to get a first table to
 sanity-check the heuristics.
 
+For agent follow-up, the MCP server exposes `high_interval_diagnoses` (filter by
+`status` = actionable / investigate / benign / pending, or by `reason`), which
+returns each high interval with its reason, summary, reconciliation stats and
+per-model breakdown, plus the raw signals when `include_signals` is set.
+
 ## Deployment
 
 See `deploy/README.md` for the deployment runbook (CircleCI -> GHCR ->

@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from deepseek_balance import heuristics
+from deepseek_balance import heuristics, mcp_server
 from deepseek_balance.analysis import AnalysisService
 from deepseek_balance.db import BalanceDB
 from deepseek_balance.heuristics import REASONS
@@ -215,3 +215,41 @@ def test_analysis_records_and_diagnoses(tmp_path):
     # idempotent: a second pass finds nothing new to diagnose
     report2 = svc.run(now=now)
     assert report2["newly_diagnosed"] == 0
+
+
+def test_high_intervals_detailed_includes_signals(tmp_path):
+    db = BalanceDB(str(tmp_path / "t2.db"))
+    phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    now = datetime.now(UTC).replace(tzinfo=UTC)
+    _seed_balance(db, now, spend_total=100.0)
+    svc.run(now=now)
+
+    rows = db.high_intervals_detailed(limit=50, include_signals=True)
+    assert rows
+    diag = rows[0]["diagnosis"]
+    assert diag["signals"] is not None
+    assert diag["signals"]["request_count"] >= 0
+
+
+def test_mcp_high_interval_diagnoses(tmp_path):
+    db = BalanceDB(str(tmp_path / "mcp.db"))
+    phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    now = datetime.now(UTC).replace(tzinfo=UTC)
+    _seed_balance(db, now, spend_total=100.0)
+    svc.run(now=now)
+    mcp_server._db = db
+
+    out = mcp_server.high_interval_diagnoses(status="all", include_signals=True)
+    assert out["count"] >= 1
+    assert out["timezone"]
+    first = out["intervals"][0]
+    assert first["start_utc"] and first["start"]  # both UTC and local forms present
+    assert "reason" in first and "summary" in first
+    assert first["spend"] > 0
+
+    # the single fake span with no cache => classified as investigate/actionable,
+    # never 'benign'; just confirm the status filter runs and returns a list.
+    benign = mcp_server.high_interval_diagnoses(status="benign")
+    assert "intervals" in benign
