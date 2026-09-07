@@ -496,6 +496,20 @@ function renderSummary(d) {
 
 load();
 </script>
+<script>
+(function () {
+  if (window.parent === window) return;
+  function reportHeight() {
+    try {
+      var h = Math.ceil(document.documentElement.scrollHeight);
+      window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+    } catch (e) {}
+  }
+  if (document.readyState === 'complete') { reportHeight(); }
+  else { window.addEventListener('load', reportHeight); }
+  setInterval(reportHeight, 1500);
+})();
+</script>
 </body>
 </html>
 """
@@ -966,6 +980,20 @@ async function initAll() {
   }).catch(e => { anote.innerHTML = '<span class="err">' + e.message + "</span>"; });
 }
 initAll();
+</script>
+<script>
+(function () {
+  if (window.parent === window) return;
+  function reportHeight() {
+    try {
+      var h = Math.ceil(document.documentElement.scrollHeight);
+      window.parent.postMessage({ type: 'homepage-iframe-resize', height: h }, '*');
+    } catch (e) {}
+  }
+  if (document.readyState === 'complete') { reportHeight(); }
+  else { window.addEventListener('load', reportHeight); }
+  setInterval(reportHeight, 1500);
+})();
 </script>
 </body>
 </html>
