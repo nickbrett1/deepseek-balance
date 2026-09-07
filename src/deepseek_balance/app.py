@@ -709,11 +709,11 @@ function renderSummary(d) {
     return;
   }
   rows.push('<div class="row"><span class="k">Unusually high</span><span class="v up">' + (s.unusually_high_count || 0) +
-    " (" + pct(s.unusually_high_count) + ")</span></div>");
+    " (" + pct(s.unusually_high_count) + ") · over " + fmtMoney(s.spike_threshold, d.currency) + "</span></div>");
   rows.push('<div class="row"><span class="k">Around normal</span><span class="v at">' + (s.normal_count || 0) +
-    " (" + pct(s.normal_count) + ")</span></div>");
+    " (" + pct(s.normal_count) + ") · " + fmtMoney(s.below_floor, d.currency) + "–" + fmtMoney(s.spike_threshold, d.currency) + "</span></div>");
   rows.push('<div class="row"><span class="k">Below normal</span><span class="v dn">' + (s.below_count || 0) +
-    " (" + pct(s.below_count) + ")</span></div>");
+    " (" + pct(s.below_count) + ") · under " + fmtMoney(s.below_floor, d.currency) + "</span></div>");
   el.innerHTML = rows.join("");
 }
 
