@@ -329,6 +329,19 @@ class BalanceDB:
             )
         return out
 
+    def clear_analyses(self) -> dict:
+        """Delete every recorded high interval and its diagnosis, leaving the
+        balance snapshots intact.
+
+        Used to recompute the "why was it high?" analysis from scratch against
+        the same balance history after a reconciliation change (e.g. window
+        attribution). Returns a dict of the rows removed."""
+        with self._lock:
+            diagnostics = self._conn.execute("DELETE FROM interval_diagnostics").rowcount
+            intervals = self._conn.execute("DELETE FROM high_intervals").rowcount
+            self._conn.commit()
+        return {"intervals_deleted": intervals, "diagnostics_deleted": diagnostics}
+
     # --- diagnostics ------------------------------------------------------------
 
     def upsert_diagnostic(self, *, start_utc: str, diag: dict) -> None:

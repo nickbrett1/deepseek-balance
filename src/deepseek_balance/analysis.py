@@ -192,6 +192,22 @@ class AnalysisService:
         diag = heuristics.diagnose(spans, window_spend=high["spend"] or 0.0)
         return diag
 
+    def redo(self, *, now: datetime | None = None) -> dict:
+        """Wipe the recorded high-interval analysis and recompute it from scratch.
+
+        Deletes every recorded high interval and its diagnosis (balance
+        snapshots are left intact), then runs a full detection + diagnosis pass.
+        Use this after a reconciliation change (e.g. the window-attribution
+        fix) to regenerate the "investigate" table with the new logic against
+        the same, still-good balance history. Returns the run report plus what
+        was cleared.
+        """
+        now = now or _local_now()
+        cleared = self.db.clear_analyses()
+        report = self.run(now=now)
+        report["cleared"] = cleared
+        return report
+
     def run(self, *, now: datetime | None = None) -> dict:
         """One full pass: record highs over the lookback, then diagnose the new
         ones. Returns a small report dict for logging / the on-demand endpoint."""

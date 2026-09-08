@@ -249,6 +249,44 @@ def test_analysis_records_and_diagnoses(tmp_path):
     assert report2["newly_diagnosed"] == 0
 
 
+def test_clear_analyses_keeps_balances(tmp_path):
+    db = BalanceDB(str(tmp_path / "clear.db"))
+    phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    now = datetime.now(UTC).replace(tzinfo=UTC)
+    _seed_balance(db, now, spend_total=100.0)
+    svc.run(now=now)
+
+    assert db.high_intervals_detailed(limit=50)
+    cleared = db.clear_analyses()
+    assert cleared["intervals_deleted"] >= 1
+    assert cleared["diagnostics_deleted"] >= 1
+    # The balance history is untouched — analysis is derived, not source data.
+    assert db.high_intervals_detailed(limit=50) == []
+    assert db.history((now - timedelta(days=2)).isoformat())
+
+
+def test_analysis_redo_wipes_and_recomputes(tmp_path):
+    db = BalanceDB(str(tmp_path / "redo.db"))
+    phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    now = datetime.now(UTC).replace(tzinfo=UTC)
+    _seed_balance(db, now, spend_total=100.0)
+
+    first = svc.run(now=now)
+    assert first["high_intervals_known"] >= 1
+
+    # Re-running run() alone is idempotent (nothing new to diagnose)...
+    assert svc.run(now=now)["newly_diagnosed"] == 0
+
+    # ...but redo() wipes and recomputes, so rows are re-detected + re-diagnosed.
+    report = svc.redo(now=now)
+    assert report["cleared"]["intervals_deleted"] >= 1
+    assert report["high_intervals_known"] >= 1
+    assert report["newly_diagnosed"] >= 1
+    assert db.high_intervals_detailed(limit=50), "analysis repopulated after redo"
+
+
 def test_high_intervals_detailed_includes_signals(tmp_path):
     db = BalanceDB(str(tmp_path / "t2.db"))
     phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])

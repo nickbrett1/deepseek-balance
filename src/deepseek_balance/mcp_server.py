@@ -317,6 +317,42 @@ def balance_history(hours: int = 24) -> list[dict]:
     return rows
 
 
+@server.tool()
+def redo_high_interval_analysis(confirm: bool = False) -> dict:
+    """[DESTRUCTIVE] Wipe the recorded unusually-high spend-interval analysis
+    and recompute it from the unchanged balance history.
+
+    Deletes every recorded high interval and its Phoenix diagnosis (balance
+    snapshots are preserved) and re-runs detection + diagnosis with the
+    current logic. Use after a reconciliation change (e.g. the window
+    attribution fix) to regenerate the table. Pass ``confirm=True`` to run it;
+    ``confirm=False`` (default) is a safe dry-run that only reports how many
+    rows would be cleared. Requires Phoenix to be configured.
+    """
+    from . import analysis as analysis_mod
+    from .phoenix import client_from_env, is_configured
+
+    if not is_configured():
+        return {"ok": False, "error": "analysis not configured (set PHOENIX_BASE_URL)"}
+    db = get_db()
+    existing = db.high_intervals_detailed(limit=100_000, include_signals=False)
+    if not confirm:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "would_clear_intervals": len(existing),
+            "note": "Pass confirm=True to wipe the analysis and recompute it.",
+        }
+    svc = analysis_mod.AnalysisService(db, client_from_env())
+    report = svc.redo()
+    report["cleared"] = {
+        "would_clear_intervals": len(existing),
+        **report.get("cleared", {}),
+    }
+    report["ok"] = True
+    return report
+
+
 def run_stdio() -> None:
     asyncio.run(server.run_stdio_async())
 

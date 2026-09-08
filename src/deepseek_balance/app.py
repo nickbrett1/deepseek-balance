@@ -356,6 +356,25 @@ def analysis_backfill() -> dict:
         return {"error": str(exc)}
 
 
+@app.post("/analysis/redo")
+def analysis_redo() -> dict:
+    """Wipe the recorded high-interval analysis and recompute it from scratch.
+
+    Deletes every recorded high interval + diagnosis (balance snapshots are
+    kept) and runs a fresh detection + Phoenix-diagnosis pass with the current
+    logic. Use after a reconciliation change to regenerate the table against
+    the unchanged balance history.
+    """
+    service: analysis_mod.AnalysisService | None = getattr(app.state, "analysis", None)
+    if service is None:
+        return {"error": "analysis not configured (set PHOENIX_BASE_URL)"}
+    try:
+        return service.redo()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis redo failed: %s", exc)
+        return {"error": str(exc)}
+
+
 @app.get("/history", response_class=HTMLResponse)
 def history_page() -> str:
     """Drill-in view: today's data plus the daily spend/usage/cost charts.
