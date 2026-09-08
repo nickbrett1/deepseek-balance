@@ -961,8 +961,8 @@ function costHint(diag) {
 function renderAnalysis(d) {
   const tbody = document.querySelector("#ahi tbody");
   if (!d.rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">No unusually-high intervals analysed yet. '
-      + (d.configured ? "Run <code>/analysis/backfill</code> after a heavy period." : "Analysis is disabled (no PHOENIX_BASE_URL).") + "</td></tr>";
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">No unusually-high intervals analysed yet.'
+      + (d.configured ? "" : " Analysis is disabled (no PHOENIX_BASE_URL).") + "</td></tr>";
     anote.textContent = d.configured ? "" : "Set PHOENIX_BASE_URL to enable the Phoenix deep-dive.";
     return;
   }
