@@ -249,6 +249,64 @@ def test_analysis_records_and_diagnoses(tmp_path):
     assert report2["newly_diagnosed"] == 0
 
 
+def _diag(actionable: bool = False, investigate: bool = False, reason: str = "x") -> dict:
+    return {
+        "reason": reason,
+        "reason_label": reason,
+        "actionable": actionable,
+        "investigate": investigate,
+        "window_spend": 100.0,
+        "reconciled_cost": 100.0,
+        "explained_cost_pct": 100.0,
+        "request_count": 1,
+        "summary": "summary",
+        "analyzed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def test_high_intervals_with_diagnostics_status_filter(tmp_path):
+    """The status filter narrows the table to one diagnosis state each."""
+    db = BalanceDB(str(tmp_path / "filter.db"))
+    base = datetime(2025, 1, 2, tzinfo=UTC)
+    key = "2025-01-02"
+
+    def iso(mins: int) -> str:
+        return (base + timedelta(minutes=mins)).isoformat()
+
+    def rec(mins: int) -> str:
+        s = iso(mins)
+        db.record_high_interval(
+            start_utc=s, end_utc=iso(mins + 5), slice_minutes=5, spend=100.0,
+            spike_threshold=20.0, median_interval=10.0, day=key,
+            detected_at=iso(mins),
+        )
+        return s
+
+    inv = rec(0)     # investigated (Phoenix couldn't explain)
+    act = rec(10)    # actionable candidate
+    fine = rec(20)   # benign / fine
+    pend = rec(30)   # recorded but not yet diagnosed
+    db.upsert_diagnostic(start_utc=inv, diag=_diag(investigate=True))
+    db.upsert_diagnostic(start_utc=act, diag=_diag(actionable=True))
+    db.upsert_diagnostic(start_utc=fine, diag=_diag())
+
+    def starts(status: str | None) -> set[str]:
+        rows, _ = db.high_intervals_with_diagnostics(limit=50, status=status)
+        return {r["start_utc"] for r in rows}
+
+    all_rows, _ = db.high_intervals_with_diagnostics(limit=50)
+    assert {r["start_utc"] for r in all_rows} == {inv, act, fine, pend}  # default = all
+    assert starts("all") == {inv, act, fine, pend}
+    assert starts("investigate") == {inv}
+    assert starts("actionable") == {act}
+    assert starts("fine") == {fine}
+    assert starts("pending") == {pend}
+    # paging honours the filter (one pending row -> no extra page)
+    rows_pg, has_more = db.high_intervals_with_diagnostics(limit=1, status="pending")
+    assert [r["start_utc"] for r in rows_pg] == [pend]
+    assert has_more is False
+
+
 def test_clear_analyses_keeps_balances(tmp_path):
     db = BalanceDB(str(tmp_path / "clear.db"))
     phoenix = _FakePhoenix(spans=[_span(cost=5.0, input=5000, cached=0)])

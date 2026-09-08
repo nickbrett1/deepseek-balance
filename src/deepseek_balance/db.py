@@ -209,22 +209,48 @@ class BalanceDB:
         *,
         limit: int = 25,
         before_utc: str | None = None,
+        status: str | None = None,
     ) -> tuple[list[dict], bool]:
         """Diagnosed high intervals, newest first, joined with their diagnosis.
 
         Returns ``(rows, has_more)`` for paging. Each row carries the high
         interval fields plus ``diagnosis`` (the matching diagnostic dict, or
         None when it is still being analysed). ``before_utc`` pages to older
-        rows than a cursor timestamp.
+        rows than a cursor timestamp. ``status`` narrows the set to a single
+        diagnosis state: ``investigate`` (spend Phoenix couldn't explain),
+        ``actionable`` (a real optimisation candidate), ``fine`` (benign /
+        well-cached high activity), or ``pending`` (recorded but not yet
+        analysed). Pass ``None`` or ``"all"`` for every status.
         """
+        # Status predicates match the precedence used by the UI (and mirror
+        # Phoenix's diagnostic buckets): investigate > actionable > fine.
+        status_predicates = {
+            "investigate": "d.analyzed_at IS NOT NULL AND d.investigate = 1",
+            "actionable": (
+                "d.analyzed_at IS NOT NULL AND d.investigate = 0 AND d.actionable = 1"
+            ),
+            "fine": (
+                "d.analyzed_at IS NOT NULL AND d.investigate = 0 AND d.actionable = 0"
+            ),
+            "pending": "d.analyzed_at IS NULL",
+        }
         sql = """
             SELECT h.*, d.* FROM high_intervals h
             LEFT JOIN interval_diagnostics d ON d.start_utc = h.start_utc
         """
         params: list = []
+        clauses: list[str] = []
         if before_utc is not None:
-            sql += " WHERE h.start_utc < ?"
+            clauses.append("h.start_utc < ?")
             params.append(before_utc)
+        if status and status != "all":
+            if status not in status_predicates:
+                raise ValueError(
+                    "status must be one of: all, investigate, actionable, fine, pending"
+                )
+            clauses.append(status_predicates[status])
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY h.start_utc DESC LIMIT ?"
         params.append(limit + 1)  # fetch one extra to know if more pages exist
         with self._lock:

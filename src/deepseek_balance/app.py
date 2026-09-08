@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 from . import analysis as analysis_mod
@@ -287,15 +287,18 @@ def index() -> str:
     return WIDGET_HTML
 
 
-def _analysis_rows(service, limit: int, before: str | None) -> tuple[list[dict], bool, str | None]:
+def _analysis_rows(
+    service, limit: int, before: str | None, status: str | None
+) -> tuple[list[dict], bool, str | None]:
     """Query diagnosed/known high intervals, converted to server-local times.
 
     Returns ``(rows, has_more, next_before)`` for the table paginator.
+    ``status`` narrows rows to one diagnosis state (see the endpoint docstring).
     """
     if service is None:
         return [], False, None
     rows, has_more = service.db.high_intervals_with_diagnostics(
-        limit=limit, before_utc=before
+        limit=limit, before_utc=before, status=status
     )
     tz = datetime.now().astimezone().tzinfo
     out: list[dict] = []
@@ -321,22 +324,40 @@ def _analysis_rows(service, limit: int, before: str | None) -> tuple[list[dict],
     return out, has_more, next_before
 
 
+_ANALYSIS_STATUSES = {"all", "investigate", "actionable", "fine", "pending"}
+
+
 @app.get("/analysis/high-intervals")
-def analysis_high_intervals(limit: int = 15, before: str | None = None) -> dict:
+def analysis_high_intervals(
+    limit: int = 15, before: str | None = None, status: str = "all"
+) -> dict:
     """Table of unusually-high spend intervals with their Phoenix diagnosis.
 
     Newest first. Pass ``before`` (a UTC interval-start from the previous page's
     ``next_before``) to page back through older intervals. ``limit`` caps page
     size (default 15). Times are given in both UTC and the server's local time.
+
+    ``status`` filters the table by diagnosis state so the "why was it high?"
+    view can surface exactly the rows that need attention: ``investigate``
+    (spend Phoenix couldn't explain - needs a human), ``actionable`` (a real
+    optimisation candidate), ``fine`` (benign / well-cached high activity), or
+    ``pending`` (recorded but not yet analysed). Default ``all`` returns every
+    status.
     """
+    if status not in _ANALYSIS_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail="status must be one of: all, investigate, actionable, fine, pending",
+        )
     limit = max(1, min(100, limit))
     service: analysis_mod.AnalysisService | None = getattr(app.state, "analysis", None)
     if service is None:
         return {"configured": False, "timezone": None, "rows": [], "has_more": False}
-    rows, has_more, next_before = _analysis_rows(service, limit, before)
+    rows, has_more, next_before = _analysis_rows(service, limit, before, status)
     return {
         "configured": True,
         "timezone": datetime.now().astimezone().tzname(),
+        "status": status,
         "rows": rows,
         "has_more": has_more,
         "next_before": next_before,
@@ -658,7 +679,17 @@ HISTORY_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="section-title">Why were recent intervals unusually high?</div>
-  <div id="anote" class="muted" style="margin-bottom:6px">Loading…</div>
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+    <span class="muted" style="font-size:12px">Status:</span>
+    <div class="seg" id="ahiStatus" style="margin:0">
+      <button data-status="all" class="on">All</button>
+      <button data-status="investigate">Investigate</button>
+      <button data-status="actionable">Actionable</button>
+      <button data-status="fine">Fine</button>
+      <button data-status="pending">Analysing</button>
+    </div>
+    <span id="anote" class="muted" style="font-size:12px">Loading…</span>
+  </div>
   <table id="ahi">
     <thead><tr>
       <th>Interval</th><th>Spend</th><th>Req</th><th>Cache</th><th>Diagnosis</th><th>Status</th>
@@ -953,6 +984,7 @@ document.getElementById("range").addEventListener("click", (ev) => {
 
 const anote = document.getElementById("anote");
 let ahiBefore = null;          // UTC cursor for paging to older intervals
+let ahiStatus = "all";         // active diagnosis-status filter ("all" = every status)
 
 function chipFor(diag) {
   if (!diag) return '<span class="chip pend">analysing</span>';
@@ -977,12 +1009,19 @@ function costHint(diag) {
   return Math.round(diag.explained_cost_pct) + "%";
 }
 
+const STATUS_LABEL = { investigate: "Investigate", actionable: "Actionable", fine: "Fine", pending: "Analysing" };
+
 function renderAnalysis(d) {
   const tbody = document.querySelector("#ahi tbody");
   if (!d.rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">No unusually-high intervals analysed yet.'
-      + (d.configured ? "" : " Analysis is disabled (no PHOENIX_BASE_URL).") + "</td></tr>";
-    anote.textContent = d.configured ? "" : "Set PHOENIX_BASE_URL to enable the Phoenix deep-dive.";
+    const filtered = ahiStatus !== "all";
+    let msg = filtered
+      ? "No unusually-high intervals with status \u201c" + (STATUS_LABEL[ahiStatus] || ahiStatus) + "\u201d yet."
+      : "No unusually-high intervals analysed yet.";
+    if (!d.configured) msg += " Analysis is disabled (no PHOENIX_BASE_URL).";
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">' + msg + "</td></tr>";
+    anote.textContent = !d.configured && !filtered
+      ? "Set PHOENIX_BASE_URL to enable the Phoenix deep-dive." : "";
     return;
   }
   tbody.innerHTML = d.rows.map(r => {
@@ -1007,6 +1046,7 @@ function renderAnalysis(d) {
 async function loadAnalysis() {
   try {
     let url = "/analysis/high-intervals?limit=15";
+    if (ahiStatus && ahiStatus !== "all") url += "&status=" + encodeURIComponent(ahiStatus);
     if (ahiBefore) url += "&before=" + encodeURIComponent(ahiBefore);
     const d = await getJSON(url);
     renderAnalysis(d);
@@ -1014,6 +1054,18 @@ async function loadAnalysis() {
     anote.innerHTML = '<span class="err">Analysis failed to load: ' + e.message + "</span>";
   }
 }
+
+document.getElementById("ahiStatus").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const next = btn.dataset.status || "all";
+  if (next === ahiStatus) return;
+  ahiStatus = next;
+  document.querySelectorAll("#ahiStatus button").forEach(b => b.classList.remove("on"));
+  btn.classList.add("on");
+  ahiBefore = null;   // restart paging for the newly selected status
+  loadAnalysis();
+});
 
 document.getElementById("ahiBack").addEventListener("click", () => {
   if (!ahiBefore) return;
@@ -1024,11 +1076,8 @@ async function initAll() {
   try { await loadToday(); }
   catch (e) { document.getElementById("heart").innerHTML = '<div class="err">Failed to load: ' + e.message + "</div>"; }
   loadCharts().catch(e => { document.getElementById("avgline").innerHTML = '<span class="err">' + e.message + "</span>"; });
-  // The analysis table loads last; when its data arrives we set the page cursor.
-  getJSON("/analysis/high-intervals?limit=15").then(d => {
-    ahiBefore = d.next_before || null;
-    renderAnalysis(d);
-  }).catch(e => { anote.innerHTML = '<span class="err">' + e.message + "</span>"; });
+  // The analysis table loads last (status filter defaults to "all").
+  loadAnalysis();
 }
 initAll();
 </script>
