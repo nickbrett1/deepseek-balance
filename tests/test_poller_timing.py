@@ -8,7 +8,7 @@ completion timestamp.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -97,4 +97,47 @@ def test_reconciliation_attributes_drop_to_scheduled_boundary_not_completion():
     assert drop == pytest.approx(10.0)
     # Attributed to the scheduled boundary (19:05:00), not completion (19:08).
     assert to_ts == datetime(2026, 9, 7, 19, 5, 0, tzinfo=UTC)
+
+
+def test_drop_slice_index_attributes_to_preceding_window():
+    """A drop seen at a :00 boundary must reconcile to the slice that *ends*
+    there (the preceding window [t-5m, t]), not the one that starts there."""
+    from deepseek_balance.analytics import _drop_slice_index
+
+    origin = datetime(2026, 9, 7, 0, 0, tzinfo=UTC)
+    # Drop becomes visible at 19:00; the preceding 5-min slice starts 18:55.
+    idx = _drop_slice_index(datetime(2026, 9, 7, 19, 0, 0, tzinfo=UTC), origin, 300)
+    assert idx == 227
+    assert (origin + timedelta(seconds=idx * 300)).strftime("%H:%M") == "18:55"
+
+
+def test_spend_intervals_buckets_drop_one_slice_earlier(tmp_path):
+    """The memo case: a cent drop that appears at 19:00 is bucketed to the
+    18:55–19:00 window, so Phoenix is later queried over where the spend really
+    happened rather than the (empty) following window."""
+    from deepseek_balance.analytics import spend_intervals
+    from deepseek_balance.db import BalanceDB
+
+    db = BalanceDB(str(tmp_path / "w.db"))
+    # Whole-cent drop: 100.00 -> 99.96, observed at the 19:00 scheduled slot.
+    db.insert_snapshot(
+        ts="2026-09-07T18:54:58+00:00", scheduled_ts="2026-09-07T18:55:00+00:00",
+        currency="CNY", total_balance=100.0, granted_balance=100.0,
+        topped_up_balance=0.0, is_available=True, http_status=200, raw="{}",
+    )
+    db.insert_snapshot(
+        ts="2026-09-07T19:00:02+00:00", scheduled_ts="2026-09-07T19:00:00+00:00",
+        currency="CNY", total_balance=99.96, granted_balance=99.96,
+        topped_up_balance=0.0, is_available=True, http_status=200, raw="{}",
+    )
+    now = datetime(2026, 9, 7, 19, 30, tzinfo=UTC)
+    si = spend_intervals(
+        db, now, spend_slice_minutes=5,
+        summary_start_utc=datetime(2026, 9, 7, 18, 30, tzinfo=UTC),
+    )
+    intervals = [i for i in si["intervals"] if i["spend"] > 0]
+    assert len(intervals) == 1
+    # Preceding window [18:55, 19:00], not the following [19:00, 19:05].
+    assert intervals[0]["ts"] == "2026-09-07T18:55:00+00:00"
+    assert intervals[0]["spend"] == pytest.approx(0.04)
 

@@ -84,6 +84,38 @@ def test_benign_high_activity_cached():
     assert diag["investigate"] is False
 
 
+def test_cent_quantization_low_explained_is_benign_not_investigate():
+    # The memo case: a ~0.04 drop that traces explain only ~20% (≈0.008) but on
+    # cache-heavy traffic → the shortfall is a cent-quantization floor, benign.
+    spans = [_span(cost=0.002, input=4000, cached=3900, output=50) for _ in range(4)]
+    diag = heuristics.diagnose(spans, window_spend=0.04)
+    assert diag["explained_cost_pct"] is not None
+    assert diag["explained_cost_pct"] < 50
+    assert diag["reason"] == "cent_quantized"
+    assert diag["investigate"] is False
+    assert diag["actionable"] is False
+
+
+def test_cent_quantization_still_investigates_when_gap_is_real():
+    # Same cache-heavy profile but the shortfall is far beyond cent scale → the
+    # money is genuinely missing; must stay "investigate".
+    spans = [_span(cost=1.0, input=4000, cached=3900, output=50) for _ in range(4)]
+    diag = heuristics.diagnose(spans, window_spend=20.0)  # explained ~20%<50
+    assert diag["explained_cost_pct"] < 50
+    assert diag["reason"] == "unexplained"
+    assert diag["investigate"] is True
+
+
+def test_cent_quantization_not_benign_without_cache_heavy_traffic():
+    # A cent-scale shortfall but NOT cache-heavy → not safe to call it a
+    # measurement floor; keep it as investigate.
+    spans = [_span(cost=0.008, input=4000, cached=0, output=50) for _ in range(4)]
+    diag = heuristics.diagnose(spans, window_spend=0.10)  # explained ~32%<50
+    assert diag["explained_cost_pct"] < 50
+    assert diag["reason"] == "unexplained"
+    assert diag["investigate"] is True
+
+
 def test_tool_call_loop():
     spans = [_span(finish="tool_calls", cost=0.5, output=300) for _ in range(6)]
     diag = heuristics.diagnose(spans, window_spend=3.0)
@@ -119,7 +151,7 @@ def test_all_reasons_have_labels():
     for key in (
         "tool_call_loop", "bloated_context", "expensive_single_request",
         "errors_retries", "high_concurrency_cache_miss", "large_output",
-        "high_activity_cached", "unexplained",
+        "high_activity_cached", "cent_quantized", "unexplained",
     ):
         assert key in REASONS
 

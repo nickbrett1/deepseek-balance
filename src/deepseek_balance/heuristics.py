@@ -32,6 +32,7 @@ REASONS: dict[str, str] = {
     "high_concurrency_cache_miss": "High concurrency with cache misses",
     "large_output": "Unusually large output generation",
     "high_activity_cached": "High activity — mostly cache hits / normal context",
+    "cent_quantized": "Cent-quantized balance drop on cache-heavy traffic (measurement floor)",
     "unexplained": "Could not attribute — investigate",
 }
 
@@ -57,6 +58,11 @@ BLOATED_MIN_INPUT_SHARE = 0.6
 # Benign "high activity": lots of requests, cache serving most input.
 HIGH_ACTIVITY_MIN_REQUESTS = 20
 HIGH_ACTIVITY_MIN_CACHE_HIT = 0.8
+# Cent-quantization is treated as benign only when the *absolute* shortfall
+# between the balance drop and the traced cost is at the cent scale (the
+# balance source moves in whole cents) AND traffic is cache-heavy. A larger
+# shortfall is real spend that's missing and stays "investigate".
+CENT_QUANTIZATION_MAX_GAP = 0.10
 
 
 def _explained_pct(reconciled_cost: float | None, window_spend: float) -> float | None:
@@ -132,6 +138,26 @@ def summarize(spans: list[dict], *, window_spend: float) -> dict:
     }
 
 
+def _is_cent_quantization_limited(signals: dict) -> bool:
+    """True when a low explained ratio is a cent-quantization artifact rather
+    than genuinely lost spend.
+
+    The DeepSeek balance source only moves in whole cents at the poll boundary,
+    so a *small absolute* shortfall between the balance drop and the traced
+    cost on cheap, cache-heavy traffic is a measurement floor — the classifier
+    should not cry "investigate". A shortfall beyond the cent scale is real
+    missing spend and stays ``investigate``.
+    """
+    cost = signals["reconciled_cost"]
+    window_spend = signals["window_spend"]
+    if not cost or cost <= 0 or not window_spend or window_spend <= 0:
+        return False
+    if window_spend - cost > CENT_QUANTIZATION_MAX_GAP:
+        return False
+    ratio = signals["cache_hit_ratio"]
+    return ratio is not None and ratio >= HIGH_ACTIVITY_MIN_CACHE_HIT
+
+
 def classify(signals: dict) -> dict:
     """Pick the primary reason for a window from its aggregated signals."""
     n = signals["request_count"]
@@ -149,6 +175,13 @@ def classify(signals: dict) -> dict:
         return _mk("unexplained", investigate=True,
                    summary="Spans carry no cost attributes, so the spend can't be tied to LLM calls.")
     if explained is not None and explained < MIN_EXPLAINED_RATIO * 100:
+        if _is_cent_quantization_limited(signals):
+            return _mk(
+                "cent_quantized",
+                summary=(f"Balance drop ({_money(signals['window_spend'])}) is at the cent-"
+                         f"quantization floor on cache-heavy traffic — traced cost "
+                         f"({_money(cost)}) is a measurement artifact, not lost spend."),
+            )
         return _mk("unexplained", investigate=True,
                    summary=(f"Traced LLM cost ({_money(cost)}) only explains ~{explained:.0f}% "
                             f"of the {_money(signals['window_spend'])} drop — the rest is not "

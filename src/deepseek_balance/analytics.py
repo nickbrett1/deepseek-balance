@@ -73,13 +73,30 @@ def _row_time(row: dict) -> datetime:
     return datetime.fromisoformat(_row_iso(row))
 
 
+def _drop_slice_index(boundary: datetime, origin: datetime, slice_seconds: int) -> int:
+    """Grid-slice index to attribute a balance drop *first seen* at ``boundary``.
+
+    The DeepSeek balance source only ticks in whole cents at the poll (grid)
+    boundary, so a drop that becomes visible at boundary ``t`` is spend that
+    actually happened in the **preceding** slice (the one ending at ``t``), not
+    the following one (the one starting at ``t``). Reconcile each drop against
+    that preceding window, otherwise the drop is attributed one slice too late
+    and never lines up with the Phoenix spans that caused it.
+
+    Returns the raw index (may be negative for a drop on the origin boundary,
+    which belongs to the slice *before* ``origin``); callers guard/clamp.
+    """
+    return math.floor((boundary - origin).total_seconds() / slice_seconds) - 1
+
+
 def _collect_drops(rows: list[dict], max_gap_minutes: int) -> list[tuple[datetime, float]]:
     """Per-interval balance declines from a chronological row list.
 
     Each decline is attributed to the boundary of the snapshot it ended in
     (its scheduled grid slot, not completion time) and only counts when the gap
     between consecutive poll boundaries is sane (<= max_gap_minutes) so that
-    downtime gaps don't masquerade as a single big spend.
+    downtime gaps don't masquerade as a single big spend. Callers then shift
+    each decline into its *preceding* slice via :func:`_drop_slice_index`.
     """
     drops: list[tuple[datetime, float]] = []
     for i in range(1, len(rows)):
@@ -111,7 +128,9 @@ def _pool_interval_spends(
     drops = _collect_drops(rows, max_gap_minutes)
     spend_by_slice: dict[int, float] = {}
     for to_ts, drop in drops:
-        idx = math.floor((to_ts - epoch).total_seconds() / slice_seconds)
+        idx = _drop_slice_index(to_ts, epoch, slice_seconds)
+        if idx < 0:
+            continue  # drop belongs to a slice before the pooled window
         spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
     return [spend for spend in spend_by_slice.values() if spend > 0]
 
@@ -127,9 +146,9 @@ def _day_bucket_stats(
     Returns ``(total_spend, spend_by_slice)`` for the day. ``rows`` must be the
     snapshots (parsed to aware datetimes) whose timestamps fall inside
     ``[day_start_utc, day_start_utc + 1d)``. Consecutive declines become
-    per-interval spend attributed to the slice the decline ended in, so usage
-    time (number of spent slices) and cost come from the *same* pool and the
-    resulting cost-per-minute is meaningful.
+    per-interval spend attributed to the slice the decline *ended in* (its
+    preceding slice), so usage time (number of spent slices) and cost come from
+    the *same* pool and the resulting cost-per-minute is meaningful.
     """
     spend_by_slice: dict[int, float] = {}
     for i in range(1, len(rows)):
@@ -142,7 +161,9 @@ def _day_bucket_stats(
             continue
         drop = prev_bal - cur_bal
         if drop > 0:
-            idx = math.floor((cur_ts - day_start_utc).total_seconds() / slice_seconds)
+            idx = _drop_slice_index(cur_ts, day_start_utc, slice_seconds)
+            if idx < 0:
+                continue  # decline belongs to a slice before this day
             spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
     return sum(spend_by_slice.values()), spend_by_slice
 
@@ -310,7 +331,9 @@ def spend_intervals(
     )
     spend_by_slice: dict[int, float] = {}
     for to_ts, drop in drops:
-        idx = math.floor((to_ts - summary_start_utc).total_seconds() / slice_seconds)
+        # A drop seen at a poll boundary belongs to the slice just before it,
+        # matching the spans that caused it (see _drop_slice_index).
+        idx = _drop_slice_index(to_ts, summary_start_utc, slice_seconds)
         if 0 <= idx < n_slices:
             spend_by_slice[idx] = spend_by_slice.get(idx, 0.0) + drop
 
