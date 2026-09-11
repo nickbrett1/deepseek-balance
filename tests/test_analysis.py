@@ -381,3 +381,224 @@ def test_mcp_high_interval_diagnoses(tmp_path):
     # never 'benign'; just confirm the status filter runs and returns a list.
     benign = mcp_server.high_interval_diagnoses(status="benign")
     assert "intervals" in benign
+
+
+# --- T1: one-interval settlement lookback -----------------------------------
+
+def test_lookback_attributes_empty_window_to_prior_burst():
+    # A burst in the preceding interval reconciles the (empty) window's drop.
+    prior = [_span(cost=0.03, input=5000, cached=1000, output=200) for _ in range(3)]
+    diag = heuristics.diagnose_lookback(
+        prior,
+        window_spend=0.06,
+        prior_start_utc="2026-09-11T13:10:00+00:00",
+        prior_end_utc="2026-09-11T13:15:00+00:00",
+    )
+    assert diag is not None
+    assert diag["reason"] == "settled_from_prior_burst"
+    assert diag["reason_label"] == REASONS["settled_from_prior_burst"]
+    assert diag["investigate"] is False
+    assert diag["actionable"] is False
+    # The referenced burst window is recorded (auditable from the row).
+    assert diag["prior_burst_start_utc"] == "2026-09-11T13:10:00+00:00"
+    assert diag["prior_burst_end_utc"] == "2026-09-11T13:15:00+00:00"
+    assert diag["prior_burst_reason"]
+    assert diag["request_count"] == 3
+
+
+def test_lookback_none_without_prior_spans():
+    # T3b: a genuinely idle window has no lookback burst and stays "investigate".
+    assert heuristics.diagnose_lookback(
+        [], window_spend=0.06,
+        prior_start_utc="2026-09-11T13:10:00+00:00",
+        prior_end_utc="2026-09-11T13:15:00+00:00",
+    ) is None
+
+
+def test_lookback_none_when_burst_cost_far_below_drop():
+    # Escalation trigger: burst cost ≪ window spend means the charge is
+    # genuinely elsewhere — never force the settlement attribution.
+    prior = [_span(cost=0.001, input=100, cached=0, output=10) for _ in range(2)]
+    assert heuristics.diagnose_lookback(
+        prior, window_spend=5.0,
+        prior_start_utc="2026-09-11T13:10:00+00:00",
+        prior_end_utc="2026-09-11T13:15:00+00:00",
+    ) is None
+
+
+def test_settled_reason_registered():
+    assert "settled_from_prior_burst" in REASONS
+
+
+class _WindowPhoenix:
+    """Phoenix stub that only returns spans for windows in ``bursts``.
+
+    Keys are the window's start ISO prefix; everything else is idle. This is
+    what lets the lookback be exercised deterministically: the diagnosed window
+    is empty, the preceding one carries the burst.
+    """
+
+    def __init__(self, bursts: dict[str, list[dict]]):
+        self.bursts = bursts
+        self.calls: list[tuple[str, str]] = []
+
+    def fetch_llm_spans(self, start, end, pad_seconds=0):
+        self.calls.append((start, end))
+        for prefix, spans in self.bursts.items():
+            if start.startswith(prefix):
+                return spans
+        return []
+
+
+def _pair_snapshots(db, start_slot, end_slot, start_bal, end_bal):
+    """Two consecutive grid snapshots with an exact drop between them."""
+    db.insert_snapshot(
+        ts=start_slot.replace(":00+00:00", ":05+00:00"), scheduled_ts=start_slot,
+        currency="USD", total_balance=start_bal, granted_balance=0.0,
+        topped_up_balance=start_bal, is_available=True, http_status=200, raw="{}",
+    )
+    db.insert_snapshot(
+        ts=end_slot.replace(":00+00:00", ":05+00:00"), scheduled_ts=end_slot,
+        currency="USD", total_balance=end_bal, granted_balance=0.0,
+        topped_up_balance=end_bal, is_available=True, http_status=200, raw="{}",
+    )
+
+
+def test_analysis_empty_window_settles_from_prior_burst(tmp_path):
+    """T1 + T2 integration: the idle window reclassifies to the lookback reason,
+    points at the prior burst, and records the snapshot pair."""
+    db = BalanceDB(str(tmp_path / "settle.db"))
+    # The diagnosed window is [13:15, 13:20); its drop is the 13:15 -> 13:20
+    # snapshot decline, and the prior (lookback) interval is [13:10, 13:15).
+    _pair_snapshots(
+        db,
+        "2026-09-11T13:15:00+00:00", "2026-09-11T13:20:00+00:00", 4.67, 4.61,
+    )
+    phoenix = _WindowPhoenix(
+        {"2026-09-11T13:10:00": [_span(cost=0.04, input=5000, cached=1000, output=200)
+                                 for _ in range(3)]}
+    )
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    high = {
+        "start_utc": "2026-09-11T13:15:00+00:00",
+        "end_utc": "2026-09-11T13:20:00+00:00",
+        "slice_minutes": 5,
+        "spend": 0.06,
+    }
+    diag = svc._diagnose(high)
+    assert diag is not None
+    # Before: empty window => unexplained/investigate. After: lookback reason.
+    assert diag["reason"] == "settled_from_prior_burst"
+    assert diag["investigate"] is False
+    assert diag["prior_burst_start_utc"] == "2026-09-11T13:10:00+00:00"
+    assert diag["prior_burst_end_utc"] == "2026-09-11T13:15:00+00:00"
+    # Only the current window and the one-interval lookback were queried.
+    assert [s for s, _ in phoenix.calls] == [
+        "2026-09-11T13:15:00+00:00",
+        "2026-09-11T13:10:00+00:00",
+    ]
+    # T2: the snapshot pair accounts for window_spend exactly.
+    assert diag["balance_start"] - diag["balance_end"] == pytest.approx(0.06)
+    assert diag["balance_start_ts"] == "2026-09-11T13:15:05+00:00"
+    assert diag["balance_end_ts"] == "2026-09-11T13:20:05+00:00"
+
+
+def test_analysis_empty_window_no_burst_stays_investigate(tmp_path):
+    """T3b integration: no prior burst => the genuine "investigate" is kept."""
+    db = BalanceDB(str(tmp_path / "idle.db"))
+    _pair_snapshots(
+        db,
+        "2026-09-11T13:15:00+00:00", "2026-09-11T13:20:00+00:00", 4.67, 4.61,
+    )
+    svc = AnalysisService(db, _WindowPhoenix({}), lookback_days=1)
+    high = {
+        "start_utc": "2026-09-11T13:15:00+00:00",
+        "end_utc": "2026-09-11T13:20:00+00:00",
+        "slice_minutes": 5,
+        "spend": 0.06,
+    }
+    diag = svc._diagnose(high)
+    assert diag["reason"] == "unexplained"
+    assert diag["investigate"] is True
+    assert diag["prior_burst_start_utc"] is None
+
+
+def test_analysis_populated_cent_floor_still_cent_quantized(tmp_path):
+    """T3c: the lookback must not swallow the populated small-drop case."""
+    db = BalanceDB(str(tmp_path / "cent.db"))
+    _pair_snapshots(
+        db,
+        "2026-09-08T22:45:00+00:00", "2026-09-08T22:50:00+00:00", 5.00, 4.96,
+    )
+    # The window itself is populated (cache-heavy, tiny traced cost).
+    phoenix = _WindowPhoenix(
+        {"2026-09-08T22:45:00": [_span(cost=0.002, input=4000, cached=3900, output=50)
+                                 for _ in range(4)]}
+    )
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    high = {
+        "start_utc": "2026-09-08T22:45:00+00:00",
+        "end_utc": "2026-09-08T22:50:00+00:00",
+        "slice_minutes": 5,
+        "spend": 0.04,
+    }
+    diag = svc._diagnose(high)
+    assert diag["reason"] == "cent_quantized"
+    assert diag["investigate"] is False
+
+
+def test_analysis_populated_window_unchanged(tmp_path):
+    """T3d: a normal populated window is untouched by the lookback."""
+    db = BalanceDB(str(tmp_path / "pop.db"))
+    _pair_snapshots(
+        db,
+        "2026-09-07T10:00:00+00:00", "2026-09-07T10:05:00+00:00", 5.00, 4.50,
+    )
+    phoenix = _WindowPhoenix(
+        {"2026-09-07T10:00:00": [_span(cost=0.2, input=5000, cached=4800, output=100)
+                                 for _ in range(30)]}
+    )
+    svc = AnalysisService(db, phoenix, lookback_days=1)
+    high = {
+        "start_utc": "2026-09-07T10:00:00+00:00",
+        "end_utc": "2026-09-07T10:05:00+00:00",
+        "slice_minutes": 5,
+        "spend": 6.0,
+    }
+    diag = svc._diagnose(high)
+    assert diag["reason"] == "high_activity_cached"
+    # No lookback query was made for a populated window.
+    assert [s for s, _ in phoenix.calls] == ["2026-09-07T10:00:00+00:00"]
+
+
+def test_snapshot_pair_round_trips_through_db(tmp_path):
+    """T2: the recorded pair is readable from the diagnosis row alone."""
+    db = BalanceDB(str(tmp_path / "pair.db"))
+    _pair_snapshots(
+        db,
+        "2026-09-11T13:10:00+00:00", "2026-09-11T13:15:00+00:00", 4.67, 4.61,
+    )
+    start_slot = "2026-09-11T13:15:00+00:00"
+    db.record_high_interval(
+        start_utc=start_slot, end_utc="2026-09-11T13:20:00+00:00", slice_minutes=5,
+        spend=0.06, spike_threshold=0.02, median_interval=0.01,
+        day="2026-09-11", detected_at="2026-09-11T13:20:00+00:00",
+    )
+    diag = _diag(reason="settled_from_prior_burst")
+    diag.update({
+        "window_spend": 0.06,
+        "balance_start_ts": "2026-09-11T13:10:05+00:00",
+        "balance_start": 4.67,
+        "balance_end_ts": "2026-09-11T13:15:05+00:00",
+        "balance_end": 4.61,
+        "prior_burst_start_utc": "2026-09-11T13:10:00+00:00",
+        "prior_burst_end_utc": "2026-09-11T13:15:00+00:00",
+        "prior_burst_reason": "high_activity_cached",
+    })
+    db.upsert_diagnostic(start_utc=start_slot, diag=diag)
+    rows, _ = db.high_intervals_with_diagnostics(limit=10)
+    row = next(r for r in rows if r["start_utc"] == start_slot)
+    got = row["diagnosis"]
+    assert got["balance_start"] - got["balance_end"] == pytest.approx(got["window_spend"])
+    assert got["prior_burst_start_utc"] == "2026-09-11T13:10:00+00:00"
+    assert got["prior_burst_reason"] == "high_activity_cached"

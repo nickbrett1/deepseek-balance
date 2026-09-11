@@ -33,6 +33,7 @@ REASONS: dict[str, str] = {
     "large_output": "Unusually large output generation",
     "high_activity_cached": "High activity — mostly cache hits / normal context",
     "cent_quantized": "Cent-quantized balance drop on cache-heavy traffic (measurement floor)",
+    "settled_from_prior_burst": "Settled from prior burst (balance-snapshot lag)",
     "unexplained": "Could not attribute — investigate",
 }
 
@@ -274,6 +275,91 @@ def diagnose(spans: list[dict], *, window_spend: float, analyzed_at: str | None 
         "analyzed_at": decision["analyzed_at"],
         # Full signals block stored for later heuristic tuning / drill-in.
         "payload": {"signals": signals},
+    }
+    return diag
+
+
+def diagnose_lookback(
+    prior_spans: list[dict],
+    *,
+    window_spend: float,
+    prior_start_utc: str,
+    prior_end_utc: str,
+    analyzed_at: str | None = None,
+) -> dict | None:
+    """Explain an empty window as the lagged settlement of the prior interval's burst.
+
+    The balance source is polled on a grid and cent-quantized, so charges from a
+    burst post up to roughly one snapshot interval *after* the tokens were
+    consumed. A trailing settlement can therefore land in a genuinely idle
+    window: the window itself has no spans, but the **preceding** interval
+    carries the burst that caused it. When that is the case, attribute the
+    window to the prior burst instead of crying "could not attribute".
+
+    This is deliberately conservative (see the T1 escalation trigger): the
+    attribution only holds when the prior burst actually reconciles with the
+    window's drop. If the burst's traced cost is well below the drop, the charge
+    is genuinely elsewhere and the caller must keep the "unexplained" verdict —
+    forcing a settlement label there would hide real missing spend.
+
+    Returns a full diagnosis dict (same shape as :func:`diagnose`), or ``None``
+    when there is no reconciling prior burst.
+    """
+    if not prior_spans:
+        return None
+    prior = summarize(prior_spans, window_spend=window_spend)
+    cost = prior["reconciled_cost"]
+    if not cost or cost <= 0:
+        return None
+    # Burst cost must plausibly cover the settlement: a burst whose traced cost
+    # is far short of the drop is not the explanation, so do not force it.
+    if window_spend and window_spend > 0 and cost < window_spend * MIN_EXPLAINED_RATIO:
+        return None
+    # The prior window's own primary reason is the burst signature we attribute
+    # to. It cannot be the reconciliation-mismatch branch here (we just checked
+    # cost >= MIN_EXPLAINED_RATIO of the drop).
+    prior_reason = classify(prior)["reason"]
+
+    decision = _mk(
+        "settled_from_prior_burst",
+        summary=(
+            f"No LLM spans in this window, but the preceding interval "
+            f"({prior_start_utc} → {prior_end_utc}) carries a burst of "
+            f"{prior['request_count']} requests costing {_money(cost)}. The "
+            f"{_money(window_spend)} drop is a lagged settlement of that burst "
+            f"(balances are polled on a grid and cent-quantized); burst "
+            f"signature: {prior_reason}."
+        ),
+    )
+    decision["analyzed_at"] = analyzed_at or datetime.now(UTC).isoformat()
+    diag = {
+        **decision,
+        "reason_label": REASONS["settled_from_prior_burst"],
+        "window_spend": window_spend,
+        "reconciled_cost": cost,
+        "explained_cost_pct": _explained_pct(cost, window_spend),
+        "request_count": prior["request_count"],
+        "cache_read_tokens": prior["cache_read_tokens"],
+        "uncached_input_tokens": prior["uncached_input_tokens"],
+        "output_tokens": prior["output_tokens"],
+        "cache_hit_ratio": prior["cache_hit_ratio"],
+        "error_count": prior["error_count"],
+        "tool_call_count": prior["tool_call_count"],
+        "top_models": prior["top_models"],
+        # The referenced burst window — this is what makes the lookback
+        # auditable from the row itself rather than trusted.
+        "prior_burst_start_utc": prior_start_utc,
+        "prior_burst_end_utc": prior_end_utc,
+        "prior_burst_reason": prior_reason,
+        "payload": {
+            "signals": prior,
+            "lookback": {
+                "prior_burst_start_utc": prior_start_utc,
+                "prior_burst_end_utc": prior_end_utc,
+                "prior_burst_reason": prior_reason,
+                "prior_burst_cost": cost,
+            },
+        },
     }
     return diag
 

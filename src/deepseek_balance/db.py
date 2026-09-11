@@ -66,7 +66,14 @@ CREATE TABLE IF NOT EXISTS interval_diagnostics (
   top_models TEXT,                -- JSON list of {model, cost, requests}
   summary TEXT,                   -- one-line human explanation
   payload TEXT,                   -- full JSON diagnosis (signals, for tuning)
-  analyzed_at TEXT                -- when the dive last ran (UTC)
+  analyzed_at TEXT,               -- when the dive last ran (UTC)
+  balance_start_ts TEXT,          -- snapshot ts whose balance opens the window
+  balance_start REAL,             -- total_balance at balance_start_ts
+  balance_end_ts TEXT,            -- snapshot ts whose balance closes the window
+  balance_end REAL,               -- total_balance at balance_end_ts
+  prior_burst_start_utc TEXT,     -- referenced prior burst window (settlement lag)
+  prior_burst_end_utc TEXT,
+  prior_burst_reason TEXT         -- the burst's own primary reason
 );
 """
 
@@ -89,6 +96,17 @@ class BalanceDB:
         self._conn.executescript(SCHEMA)
         self._migrate()
 
+    # Columns added after the initial schema; ALTERed in on existing DBs.
+    _DIAGNOSTIC_ADDED_COLUMNS = (
+        ("balance_start_ts", "TEXT"),
+        ("balance_start", "REAL"),
+        ("balance_end_ts", "TEXT"),
+        ("balance_end", "REAL"),
+        ("prior_burst_start_utc", "TEXT"),
+        ("prior_burst_end_utc", "TEXT"),
+        ("prior_burst_reason", "TEXT"),
+    )
+
     def _migrate(self) -> None:
         """Bring existing DBs up to date (CREATE IF NOT EXISTS won't add columns)."""
         with self._lock:
@@ -97,7 +115,16 @@ class BalanceDB:
                 self._conn.execute(
                     "ALTER TABLE balance_snapshots ADD COLUMN scheduled_ts TEXT"
                 )
-                self._conn.commit()
+            diag_cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(interval_diagnostics)")
+            }
+            for name, decl in self._DIAGNOSTIC_ADDED_COLUMNS:
+                if name not in diag_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE interval_diagnostics ADD COLUMN {name} {decl}"
+                    )
+            self._conn.commit()
 
     def insert_snapshot(
         self,
@@ -281,6 +308,17 @@ class BalanceDB:
                     "top_models": json.loads(r.pop("top_models") or "[]"),
                     "summary": r.pop("summary"),
                     "analyzed_at": r.pop("analyzed_at"),
+                    # Balance snapshot pair that produced this window's drop
+                    # (T2): readable without a separate balance_history call.
+                    "balance_start_ts": r.pop("balance_start_ts", None),
+                    "balance_start": r.pop("balance_start", None),
+                    "balance_end_ts": r.pop("balance_end_ts", None),
+                    "balance_end": r.pop("balance_end", None),
+                    # Referenced prior burst when this window is a lagged
+                    # settlement (T1).
+                    "prior_burst_start_utc": r.pop("prior_burst_start_utc", None),
+                    "prior_burst_end_utc": r.pop("prior_burst_end_utc", None),
+                    "prior_burst_reason": r.pop("prior_burst_reason", None),
                 }
             out.append(
                 {
@@ -349,6 +387,13 @@ class BalanceDB:
                         "top_models": json.loads(r["top_models"] or "[]"),
                         "summary": r["summary"],
                         "analyzed_at": r["analyzed_at"],
+                        "balance_start_ts": r["balance_start_ts"],
+                        "balance_start": r["balance_start"],
+                        "balance_end_ts": r["balance_end_ts"],
+                        "balance_end": r["balance_end"],
+                        "prior_burst_start_utc": r["prior_burst_start_utc"],
+                        "prior_burst_end_utc": r["prior_burst_end_utc"],
+                        "prior_burst_reason": r["prior_burst_reason"],
                         "signals": signals,
                     },
                 }
@@ -380,8 +425,11 @@ class BalanceDB:
                   window_spend, reconciled_cost, explained_cost_pct,
                   request_count, cache_read_tokens, uncached_input_tokens,
                   output_tokens, cache_hit_ratio, error_count, tool_call_count,
-                  top_models, summary, payload, analyzed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  top_models, summary, payload, analyzed_at,
+                  balance_start_ts, balance_start, balance_end_ts, balance_end,
+                  prior_burst_start_utc, prior_burst_end_utc, prior_burst_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(start_utc) DO UPDATE SET
                   reason=excluded.reason,
                   reason_label=excluded.reason_label,
@@ -400,7 +448,14 @@ class BalanceDB:
                   top_models=excluded.top_models,
                   summary=excluded.summary,
                   payload=excluded.payload,
-                  analyzed_at=excluded.analyzed_at
+                  analyzed_at=excluded.analyzed_at,
+                  balance_start_ts=excluded.balance_start_ts,
+                  balance_start=excluded.balance_start,
+                  balance_end_ts=excluded.balance_end_ts,
+                  balance_end=excluded.balance_end,
+                  prior_burst_start_utc=excluded.prior_burst_start_utc,
+                  prior_burst_end_utc=excluded.prior_burst_end_utc,
+                  prior_burst_reason=excluded.prior_burst_reason
                 """,
                 (
                     start_utc,
@@ -422,6 +477,13 @@ class BalanceDB:
                     diag.get("summary"),
                     _json(diag.get("payload")),
                     diag.get("analyzed_at"),
+                    diag.get("balance_start_ts"),
+                    diag.get("balance_start"),
+                    diag.get("balance_end_ts"),
+                    diag.get("balance_end"),
+                    diag.get("prior_burst_start_utc"),
+                    diag.get("prior_burst_end_utc"),
+                    diag.get("prior_burst_reason"),
                 ),
             )
             self._conn.commit()
@@ -451,6 +513,28 @@ class BalanceDB:
                 WHERE is_available = 1 AND http_status = 200
                 ORDER BY ts DESC LIMIT 1
                 """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def snapshot_at(self, slot_iso: str) -> dict | None:
+        """The snapshot that a grid slot maps to, for balance-pair attribution.
+
+        A spend slice's boundaries are grid slots (e.g. ``…T13:15:00+00:00``).
+        Polls stamp ``scheduled_ts`` with the slot they were meant to cover and
+        ``ts`` with the few-seconds-later completion time; prefer the scheduled
+        boundary and fall back to ``ts`` for legacy rows (matching
+        :func:`analytics._row_iso`).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT ts, scheduled_ts, total_balance
+                FROM balance_snapshots
+                WHERE total_balance IS NOT NULL
+                  AND (scheduled_ts = ? OR (scheduled_ts IS NULL AND ts = ?))
+                ORDER BY ts ASC LIMIT 1
+                """,
+                (slot_iso, slot_iso),
             ).fetchone()
         return dict(row) if row else None
 

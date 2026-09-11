@@ -207,6 +207,18 @@ include tool-call loops, bloated (cache-miss) contexts, a single dominant
 request, errors/retries, and high-concurrency cache misses; well-cached high
 activity is marked benign (not an optimisation candidate).
 
+Because balances are polled on a grid and cent-quantized, a burst's charges can
+settle up to ~one snapshot interval *after* the tokens were consumed, landing a
+trailing charge in an otherwise-idle window. When a window has no LLM spans but
+the **preceding** interval carries a burst that reconciles with the drop, the
+window is attributed to it (`settled_from_prior_burst`, with the referenced
+burst window recorded) instead of being flagged `unexplained`. Only
+`cent_quantized` (a genuine measurement floor on populated, cache-heavy
+windows) and truly idle windows still reach `investigate`. Every diagnosis row
+also stores the balance snapshot pair (`balance_start`/`balance_end` and their
+timestamps) whose decline is `window_spend`, so the settlement lag is visible in
+the data rather than inferred from a separate history call.
+
 Endpoints: `GET /analysis/high-intervals` (paged table, newest first, `before`
 cursor for paging back) and `POST /analysis/backfill` (run a pass on demand).
 A startup + periodic backfill keeps the table populated once Phoenix is

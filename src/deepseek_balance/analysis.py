@@ -178,6 +178,42 @@ class AnalysisService:
 
     # --- diagnosis ---------------------------------------------------------
 
+    def _prior_window(self, high: dict) -> tuple[str, str] | None:
+        """The one-snapshot-interval window immediately before this one.
+
+        Balances are polled on a grid and cent-quantized, so a burst's charges
+        can settle in the following, otherwise-idle window. The lookback is
+        deliberately exactly one ``slice_minutes`` wide (never wider — a longer
+        lookback absorbs genuinely idle periods and manufactures attributions).
+        """
+        slice_minutes = high.get("slice_minutes") or _int_env("SPEND_SLICE_MINUTES", 5)
+        try:
+            start = datetime.fromisoformat(high["start_utc"])
+        except (TypeError, ValueError):
+            return None
+        prior_start = start - timedelta(minutes=slice_minutes)
+        return prior_start.isoformat(), start.isoformat()
+
+    def _attach_balance_pair(self, diag: dict, high: dict) -> None:
+        """Record the snapshot pair whose drop this window explains (T2).
+
+        ``window_spend`` is the balance decline between the two grid-slot
+        snapshots bracketing the slice, so the pair (``balance_start`` −
+        ``balance_end``) accounts for it exactly and the settlement lag becomes
+        visible in the row rather than inferable from a separate history call.
+        """
+        start = self.db.snapshot_at(high["start_utc"])
+        end = self.db.snapshot_at(high["end_utc"])
+        diag["balance_start_ts"] = start["ts"] if start else None
+        diag["balance_start"] = start["total_balance"] if start else None
+        diag["balance_end_ts"] = end["ts"] if end else None
+        diag["balance_end"] = end["total_balance"] if end else None
+        # Keep the referenced-burst keys present on every row, so a plain
+        # "unexplained" window and a lookback-attributed one have the same shape.
+        diag.setdefault("prior_burst_start_utc", None)
+        diag.setdefault("prior_burst_end_utc", None)
+        diag.setdefault("prior_burst_reason", None)
+
     def _diagnose(self, high: dict) -> dict | None:
         """Query Phoenix over the (widened) interval and classify it."""
         if self.phoenix is None:
@@ -189,7 +225,37 @@ class AnalysisService:
         except (httpx.HTTPError, OSError, ValueError) as exc:  # leave unanalyzed
             logger.warning("Phoenix fetch failed for %s: %s", high["start_utc"], exc)
             return None
-        diag = heuristics.diagnose(spans, window_spend=high["spend"] or 0.0)
+        window_spend = high["spend"] or 0.0
+        diag = heuristics.diagnose(spans, window_spend=window_spend)
+
+        # One-interval lookback: an empty window may be a lagged settlement of
+        # the preceding interval's burst (T1). Only attempted when the window
+        # truly has no LLM traffic, so the populated paths — including the
+        # small-drop `cent_quantized` case, which needs spans to exist — are
+        # never reclassified as lag.
+        if diag["reason"] == "unexplained" and diag["request_count"] == 0:
+            prior = self._prior_window(high)
+            if prior is not None:
+                prior_start, prior_end = prior
+                try:
+                    prior_spans = self.phoenix.fetch_llm_spans(
+                        prior_start, prior_end, pad_seconds=self.pad_seconds
+                    )
+                except (httpx.HTTPError, OSError, ValueError) as exc:
+                    logger.warning(
+                        "Phoenix lookback fetch failed for %s: %s", high["start_utc"], exc
+                    )
+                    prior_spans = []
+                look = heuristics.diagnose_lookback(
+                    prior_spans,
+                    window_spend=window_spend,
+                    prior_start_utc=prior_start,
+                    prior_end_utc=prior_end,
+                )
+                if look is not None:
+                    diag = look
+
+        self._attach_balance_pair(diag, high)
         return diag
 
     def redo(self, *, now: datetime | None = None) -> dict:

@@ -255,6 +255,14 @@ def high_interval_diagnoses(
                     "tool_call_count": diag["tool_call_count"],
                     "top_models": diag["top_models"],
                     "analyzed_at": diag["analyzed_at"],
+                    # Balance snapshot pair + referenced prior burst (T1/T2).
+                    "balance_start_ts": diag.get("balance_start_ts"),
+                    "balance_start": diag.get("balance_start"),
+                    "balance_end_ts": diag.get("balance_end_ts"),
+                    "balance_end": diag.get("balance_end"),
+                    "prior_burst_start_utc": diag.get("prior_burst_start_utc"),
+                    "prior_burst_end_utc": diag.get("prior_burst_end_utc"),
+                    "prior_burst_reason": diag.get("prior_burst_reason"),
                 }
             )
             if include_signals and diag.get("signals") is not None:
