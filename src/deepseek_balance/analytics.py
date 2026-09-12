@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import statistics
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
 DAY_SECONDS = 86400.0
 
@@ -60,7 +61,7 @@ def _spend_from_balances(balances: list[float | None]) -> float:
     because it never discards a decline for spanning a long gap.
     """
     total = 0.0
-    for prev, cur in zip(balances, balances[1:]):
+    for prev, cur in pairwise(balances):
         if prev is None or cur is None:
             continue
         if cur < prev:
