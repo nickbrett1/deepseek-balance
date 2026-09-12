@@ -241,6 +241,30 @@ def test_daily_heartbeat_baseline(tmp_path):
     db.close()
 
 
+def test_daily_heartbeat_spend_survives_topup(tmp_path):
+    db = BalanceDB(str(tmp_path / "t.db"))
+    # Yesterday: 100 -> 90 (¥10 spent).
+    _insert(db, "2026-01-14T08:00:00+00:00", 100.0)
+    _insert(db, "2026-01-14T20:00:00+00:00", 90.0)
+    # This morning: a ¥20 top-up lifts the balance to 110, then ¥2 of real spend
+    # brings it to 108. Net day delta (90 - 108) is negative, so a naive
+    # day-start-now figure would clamp the day's spend to zero.
+    _insert(db, "2026-01-15T02:00:00+00:00", 90.0)
+    _insert(db, "2026-01-15T02:05:00+00:00", 110.0)  # top-up
+    _insert(db, "2026-01-15T10:00:00+00:00", 108.0)
+
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    d = daily_heartbeat(db, now)
+
+    assert d["current_balance"] == 108.0
+    assert d["prev_balance"] == 90.0
+    assert d["spent_today"] == 2.0  # the top-up is not counted as negative spend
+    # Projection extends from today's balance, not the stale day-start one.
+    assert round(d["projected_spend"], 6) == 4.0
+    assert d["projected_end_balance"] == 106.0
+    db.close()
+
+
 def test_daily_heartbeat_spend_summary_needs_data(tmp_path):
     db = BalanceDB(str(tmp_path / "s.db"))
     # Only a couple of spent intervals in the 24h window -> not enough data yet.

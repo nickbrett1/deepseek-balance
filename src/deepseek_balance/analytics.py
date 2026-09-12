@@ -49,6 +49,25 @@ def _mad(values: list[float], center: float) -> float:
     return _median([abs(v - center) for v in values]) or 0.0
 
 
+def _spend_from_balances(balances: list[float | None]) -> float:
+    """Total decline across a chronological balance series, top-up safe.
+
+    Sums every *decrease* between consecutive snapshots and ignores
+    *increases*. A plain ``first - last`` net delta treats a mid-series top-up
+    (or grant) as negative spend, so a day that spent money but also topped up
+    would read as zero. Summing only the declines keeps the top-up out of the
+    spend figure, and (unlike the per-interval path) tolerates sparse polling
+    because it never discards a decline for spanning a long gap.
+    """
+    total = 0.0
+    for prev, cur in zip(balances, balances[1:]):
+        if prev is None or cur is None:
+            continue
+        if cur < prev:
+            total += prev - cur
+    return total
+
+
 def _minutes_between(a: str, b: str) -> float | None:
     try:
         return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() / 60.0
@@ -475,11 +494,16 @@ def daily_heartbeat(
     today_rows = db.history(sod_utc.isoformat(), before_iso=tomorrow_utc.isoformat())
     today_points = [{"ts": r["ts"], "total_balance": r["total_balance"]} for r in today_rows]
 
+    # Today's spend is the sum of the day's balance *declines*, not the net
+    # day-start-to-now delta: a top-up (or grant) raises the balance and would
+    # otherwise cancel out — or outright zero — the spend that actually
+    # happened, even while the interval breakdown still shows spent slices.
     spent_today = None
-    if prev_balance is not None and current_balance is not None:
-        spent_today = max(0.0, prev_balance - current_balance)
-    elif current_balance is not None and today_rows:
-        spent_today = max(0.0, today_rows[0]["total_balance"] - current_balance)
+    if current_balance is not None and (prev_balance is not None or today_rows):
+        start = prev_balance if prev_balance is not None else today_rows[0]["total_balance"]
+        spent_today = _spend_from_balances(
+            [start] + [r["total_balance"] for r in today_rows]
+        )
 
     # --- normal daily spend over recent complete days ----------------------
     spent_yesterday = None
@@ -492,8 +516,10 @@ def daily_heartbeat(
             continue
         before_rows = db.history((day_start - timedelta(days=1)).isoformat(), before_iso=day_start.isoformat())
         start_bal = before_rows[-1]["total_balance"] if before_rows else rows[0]["total_balance"]
-        end_bal = rows[-1]["total_balance"]
-        spend = max(0.0, start_bal - end_bal)
+        # Top-up safe, matching how spent_today is computed.
+        spend = _spend_from_balances(
+            [start_bal] + [r["total_balance"] for r in rows]
+        )
         if d == 1:
             spent_yesterday = spend
         day_spends.append(spend)
@@ -503,8 +529,11 @@ def daily_heartbeat(
     fraction = max(0.01, min(1.0, (now - sod_local).total_seconds() / DAY_SECONDS))
     projected_spend = (spent_today / fraction) if spent_today is not None else None
     projected_end_balance = None
-    if prev_balance is not None and projected_spend is not None:
-        projected_end_balance = max(0.0, prev_balance - projected_spend)
+    if current_balance is not None and projected_spend is not None and spent_today is not None:
+        # Extend from *today's* balance so a top-up doesn't leave the projection
+        # anchored to the (stale) day-start balance.
+        remaining_spend = max(0.0, projected_spend - spent_today)
+        projected_end_balance = max(0.0, current_balance - remaining_spend)
     spend_vs_normal = None
     if projected_spend is not None and normal_spend and normal_spend > 0:
         spend_vs_normal = projected_spend / normal_spend
