@@ -100,6 +100,30 @@ def _span_start(span: dict) -> str | None:
     return None
 
 
+def _conversation_id(span: dict) -> str | None:
+    """A conversation/session key for the span, when the trace carries one.
+
+    Lets the burst classifier group an agent-loop's turns so it can see a
+    conversation's context grow while its prompt cache stays pinned. Phoenix
+    exposes the trace id on the span, LiteLLM/OTel carry ``session.id`` or
+    ``gen_ai.conversation.id`` — any one is enough.
+    """
+    for getter in (
+        lambda: span.get("trace_id"),
+        lambda: (span.get("context") or {}).get("trace_id"),
+        lambda: attr(span, "session.id"),
+        lambda: attr(span, "gen_ai.conversation.id"),
+        lambda: attr(span, "context.trace_id"),
+    ):
+        try:
+            value = getter()
+        except (AttributeError, TypeError):
+            value = None
+        if value:
+            return str(value)
+    return None
+
+
 def span_metrics(span: dict) -> dict:
     """Extract the metrics the heuristics care about from one LLM span.
 
@@ -144,6 +168,8 @@ def span_metrics(span: dict) -> dict:
     return {
         "cost": cost,
         "start_time": _span_start(span),
+        "conversation_id": _conversation_id(span),
+        "prompt_tokens": input_tokens,
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached_input,
         "cache_read_tokens": cache_read,

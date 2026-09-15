@@ -64,6 +64,7 @@ def _tuning() -> dict:
         "normal_band": _float("NORMAL_BAND", 2.0),
         "max_gap_minutes": _int("MAX_GAP_MINUTES", 30),
         "baseline_days": _int("BASELINE_DAYS", 14),
+        "burst_gap_slices": _int("BURST_GAP_SLICES", 1),
     }
 
 
@@ -108,9 +109,13 @@ server = MCPServer(
         "`list_spend_intervals` for individual periods, optionally filtered by "
         "`bucket` ('high' | 'normal' | 'below'). When following up on a heavy "
         "period, use `high_interval_diagnoses` to see why unusually-high "
-        "intervals were flagged (Phoenix-trace reasons: actionable candidates, "
-        "benign well-cached activity, peak_pricing where the 2x peak-hour rate "
-        "is the story, or 'investigate' where the spend wasn't explained)."
+        "intervals were flagged (Phoenix-trace reasons: actionable candidates "
+        "such as cache_prefix_unstable / tool_call_loop, benign well-cached "
+        "activity, peak_pricing where the 2x peak-hour rate is the story, or "
+        "'investigate' where the spend wasn't explained). Each row is one "
+        "*burst* — adjacent high slices reconciled and classified together, "
+        "with a lag allowance — carrying `burst_id`, `member_slice_count` and "
+        "the actionable `signature`."
     ),
 )
 
@@ -209,6 +214,17 @@ def high_interval_diagnoses(
     extra the 2x peak rate added over off-peak rates for the same tokens.
     `reconciled_cost` is token-derived at that band; `reconciled_cost_litellm`
     is the tracer's flat (peak-rate) figure kept for reference.
+
+    Each entry is one **burst** (adjacent high slices reconciled together, so a
+    spike straddling a slice boundary is not split into an over-attributed slice
+    and a bogus `unexplained` one). Burst rows carry `burst_id`,
+    `burst_start_utc` / `burst_end_utc`, `burst_spend`, `member_slice_count`
+    (slices folded in), `reconciled_cost_lag_slices` (the attribution lag used),
+    and `signature` — the actionable traffic shape, separate from `reason`
+    (which can also be the attribution-health verdicts `unexplained` /
+    `over_attributed`). For the `cache_prefix_unstable` signature,
+    `conversation_count`, `top_conversation_id`, `prefix_tokens` and
+    `peak_prompt_tokens` make the finding self-explanatory.
     """
     if status not in ("all", "actionable", "investigate", "benign", "pending"):
         raise ValueError("status must be one of: all, actionable, investigate, benign, pending")
@@ -273,6 +289,20 @@ def high_interval_diagnoses(
                     "prior_burst_start_utc": diag.get("prior_burst_start_utc"),
                     "prior_burst_end_utc": diag.get("prior_burst_end_utc"),
                     "prior_burst_reason": diag.get("prior_burst_reason"),
+                    # Burst-level reconciliation: the row is one burst, reconciled
+                    # with a lag allowance, labelled by the actionable `signature`
+                    # as well as the attribution-health `reason`.
+                    "signature": diag.get("signature"),
+                    "burst_id": diag.get("burst_id"),
+                    "burst_start_utc": diag.get("burst_start_utc"),
+                    "burst_end_utc": diag.get("burst_end_utc"),
+                    "burst_spend": diag.get("burst_spend"),
+                    "member_slice_count": diag.get("member_slice_count"),
+                    "reconciled_cost_lag_slices": diag.get("reconciled_cost_lag_slices"),
+                    "conversation_count": diag.get("conversation_count"),
+                    "top_conversation_id": diag.get("top_conversation_id"),
+                    "prefix_tokens": diag.get("prefix_tokens"),
+                    "peak_prompt_tokens": diag.get("peak_prompt_tokens"),
                 }
             )
             if include_signals and diag.get("signals") is not None:

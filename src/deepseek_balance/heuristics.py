@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+from itertools import pairwise
 
 from . import pricing
 
@@ -43,17 +44,51 @@ REASONS: dict[str, str] = {
     "high_concurrency_cache_miss": "High concurrency with cache misses",
     "large_output": "Unusually large output generation",
     "peak_pricing": "Peak-hour rate (2x off-peak)",
+    "cache_prefix_unstable": "Unstable prompt-cache prefix (per-turn cache miss)",
     "high_activity_cached": "High activity — mostly cache hits / normal context",
     "cent_quantized": "Cent-quantized balance drop (measurement floor)",
+    "over_attributed": "Over-attributed (traced cost exceeds the drop)",
     "settled_from_prior_burst": "Settled from prior burst (balance-snapshot lag)",
     "unexplained": "Could not attribute — investigate",
 }
+
+# Reasons that are an actionable *signature* of the traffic (as opposed to an
+# attribution-health verdict). ``diagnose`` copies the winning one into the
+# row's ``signature`` field so the finding is separable from the health label.
+SIGNATURES: frozenset[str] = frozenset(
+    {
+        "cache_prefix_unstable",
+        "tool_call_loop",
+        "bloated_context",
+        "expensive_single_request",
+        "errors_retries",
+        "high_concurrency_cache_miss",
+        "large_output",
+        "peak_pricing",
+        "high_activity_cached",
+        "cent_quantized",
+    }
+)
 
 # Explainability bar: if traced cost is well under half the balance drop the
 # money is not coming from the calls Phoenix saw, so mark it unexplained.
 # Both figures are USD here (the balance is topped up in USD and litellm costs
 # are reported in USD), so the explained percentage is directly comparable.
 MIN_EXPLAINED_RATIO = 0.5
+# Attribution-health band: inside [under, over] the traces reconcile with the
+# drop; below it the money is genuinely unattributed; above it the traces cost
+# *more* than the drop (double counting or lag beyond the burst window) — which
+# is evidence, not a benign clamp.
+UNDER_FACTOR = 0.5
+OVER_FACTOR = 2.0
+# `cache_prefix_unstable`: a single conversation whose context grows turn over
+# turn while the prompt cache keeps serving only the (small) system prefix. Needs
+# a few turns to be meaningful, a non-trivial prefix, context that actually grows,
+# and a peak prompt well above what the cache serves.
+CACHE_PREFIX_MIN_TURNS = 3
+CACHE_PREFIX_MIN_TOKENS = 1_000
+CACHE_PREFIX_GROWTH = 1.5
+CACHE_PREFIX_PROMPT_OVER_PREFIX = 2.0
 # A single span is "dominant" when it is this share of the window's cost.
 DOMINANT_SPAN_SHARE = 0.7
 # A run is a "tool-call loop" once this many spans turned into tool calls.
@@ -86,6 +121,65 @@ def _explained_pct(reconciled_cost: float | None, window_spend: float) -> float 
     if reconciled_cost is None or not window_spend or window_spend <= 0:
         return None
     return reconciled_cost / window_spend * 100.0
+
+
+def _mode(values: list[float]) -> float:
+    """The most common value, bucketed to the nearest 1k tokens.
+
+    A conversation's prompt cache serves the same prefix each turn, so the
+    per-turn cache-read count clusters on the prefix size. Bucketing keeps tiny
+    variance from disguising the mode.
+    """
+    vals = [v for v in values if v]
+    if not vals:
+        return 0.0
+    rounded = [round(v / 1000.0) * 1000.0 for v in vals]
+    return Counter(rounded).most_common(1)[0][0]
+
+
+def _conversation_signals(
+    turns_by_conversation: dict[str, list[tuple[str, float, float]]],
+) -> dict:
+    """Detect a growing conversation whose prompt cache stays pinned.
+
+    This is the ``cache_prefix_unstable`` signature: one conversation, context
+    (prompt tokens) increasing turn over turn, while ``cache_read`` stays near
+    the system-prompt size and the peak prompt is far larger than what the cache
+    ever serves. Reports ``prefix_tokens`` / ``peak_prompt_tokens`` so the row is
+    self-explanatory.
+    """
+    out = {
+        "conversation_count": len(turns_by_conversation),
+        "top_conversation_id": None,
+        "prefix_tokens": None,
+        "peak_prompt_tokens": None,
+        "cache_prefix_unstable": False,
+    }
+    if not turns_by_conversation:
+        return out
+    top_id, turns = max(
+        turns_by_conversation.items(), key=lambda kv: len(kv[1])
+    )
+    out["top_conversation_id"] = top_id
+    ordered = sorted(turns, key=lambda t: t[0])
+    prompts = [p for _, p, _ in ordered]
+    reads = [r for _, _, r in ordered]
+    prefix = _mode(reads)
+    peak = max(prompts) if prompts else 0.0
+    out["prefix_tokens"] = prefix
+    out["peak_prompt_tokens"] = peak
+    if (
+        len(ordered) < CACHE_PREFIX_MIN_TURNS
+        or prefix < CACHE_PREFIX_MIN_TOKENS
+        or not prompts
+    ):
+        return out
+    growing = all(b >= a for a, b in pairwise(prompts)) and (
+        prompts[-1] >= CACHE_PREFIX_GROWTH * prompts[0]
+    )
+    if growing and peak >= CACHE_PREFIX_PROMPT_OVER_PREFIX * prefix:
+        out["cache_prefix_unstable"] = True
+    return out
 
 
 def summarize(
@@ -124,9 +218,17 @@ def summarize(
     # band -> pricing model -> [cache_hit, cache_miss, output] tokens.
     band_tokens: dict[str, dict[str, list[float]]] = {}
     models_seen: set[str] = set()
+    # conversation id -> [(start_time, prompt_tokens, cache_read_tokens)] — the
+    # turn sequence that the `cache_prefix_unstable` signature is read from.
+    conversation_turns: dict[str, list[tuple[str, float, float]]] = {}
 
     for span in spans:
         m = _span_metrics(span)
+        conv_key = m.get("conversation_id")
+        if conv_key:
+            conversation_turns.setdefault(conv_key, []).append(
+                (m.get("start_time") or "", m["input_tokens"], m["cache_read_tokens"])
+            )
         input_tokens += m["input_tokens"]
         uncached += m["uncached_input_tokens"]
         cache_read += m["cache_read_tokens"]
@@ -214,8 +316,14 @@ def summarize(
         )
 
     cache_hit_ratio = (cache_read / input_tokens) if input_tokens else None
+    conversations = _conversation_signals(conversation_turns)
 
     return {
+        "conversation_count": conversations["conversation_count"],
+        "top_conversation_id": conversations["top_conversation_id"],
+        "prefix_tokens": conversations["prefix_tokens"],
+        "peak_prompt_tokens": conversations["peak_prompt_tokens"],
+        "cache_prefix_unstable": conversations["cache_prefix_unstable"],
         "request_count": n,
         "reconciled_cost": reconciled,
         "reconciled_cost_expected": expected,
@@ -345,7 +453,18 @@ def classify(signals: dict) -> dict:
     if cost is None:
         return _mk("unexplained", investigate=True,
                    summary="Spans carry no cost attributes, so the spend can't be tied to LLM calls.")
-    if explained is not None and explained < MIN_EXPLAINED_RATIO * 100:
+
+    # Attribution health, in band order: over-attributed cost is evidence of a
+    # double count or a lag longer than the burst window, so it is surfaced —
+    # not silently clamped into a benign bucket the way it used to be.
+    if explained is not None and explained > OVER_FACTOR * 100:
+        return _mk("over_attributed", investigate=True,
+                   summary=(f"Traced LLM cost ({_money(cost)}) is ~{explained:.0f}% of the "
+                            f"{_money(signals['window_spend'])} drop — more than the drop "
+                            "itself; cost is double counted or the meter lags beyond this "
+                            "burst window."))
+
+    if explained is not None and explained < UNDER_FACTOR * 100:
         if _is_cent_quantization_limited(signals):
             return _mk(
                 "cent_quantized",
@@ -357,6 +476,16 @@ def classify(signals: dict) -> dict:
                    summary=(f"Traced LLM cost ({_money(cost)}) only explains ~{explained:.0f}% "
                             f"of the {_money(signals['window_spend'])} drop — the rest is not "
                             "accounted for; investigate."))
+
+    # A growing conversation whose prompt cache stays pinned is the signature
+    # the burst layer exists to name; it beats the generic "bloated context"
+    # rule below (which would otherwise fire on the same uncached-input mass).
+    if signals.get("cache_prefix_unstable"):
+        return _mk("cache_prefix_unstable", actionable=True,
+                   summary=(f"Context grew to {_tokens(signals['peak_prompt_tokens'])} while "
+                            f"the prompt cache stayed pinned at ~{_tokens(signals['prefix_tokens'])} "
+                            f"per turn — {_tokens(signals['uncached_input_tokens'])} uncached input "
+                            "across the conversation; the cache prefix is unstable."))
 
     share = signals["dominant_span_share"]
     error_share = signals["error_count"] / n if n else 0.0
@@ -443,11 +572,23 @@ def diagnose(
     window_start_utc: str | None = None,
     window_end_utc: str | None = None,
     analyzed_at: str | None = None,
+    burst_id: str | None = None,
+    burst_start_utc: str | None = None,
+    burst_end_utc: str | None = None,
+    member_slice_count: int = 1,
+    lag_slices: int = 0,
 ) -> dict:
     """Full diagnosis for a window: signals + classified reason.
 
     The window bounds are optional but recommended: they let pricing fall back
     to the right band for spans that carry no start time of their own.
+
+    ``burst_*`` / ``member_slice_count`` / ``lag_slices`` describe the burst the
+    window belongs to (a bare slice is a one-member burst): the burst bounds,
+    how many slices were folded in, and the lag (in slices) allowed when the
+    spans were attributed. ``lag_slices`` defaults to 0 so a window diagnosed
+    on its own is reconciled without a lag allowance; the analysis service
+    passes the burst's configured lag.
     """
     signals = summarize(
         spans,
@@ -467,6 +608,7 @@ def diagnose(
     diag = {
         "reason": decision["reason"],
         "reason_label": REASONS[decision["reason"]],
+        "signature": decision.get("signature"),
         "actionable": decision.get("actionable", False),
         "investigate": decision.get("investigate", False),
         "summary": decision["summary"],
@@ -487,6 +629,19 @@ def diagnose(
         "tool_call_count": signals["tool_call_count"],
         "top_models": signals["top_models"],
         "analyzed_at": decision["analyzed_at"],
+        # Burst identity + granularity: which burst this row reconciles, how
+        # many slices it folded, and the lag allowance used to attribute spans.
+        "burst_id": burst_id or burst_start_utc or window_start_utc,
+        "burst_start_utc": burst_start_utc or window_start_utc,
+        "burst_end_utc": burst_end_utc or window_end_utc,
+        "burst_spend": signals["window_spend"],
+        "member_slice_count": member_slice_count,
+        "reconciled_cost_lag_slices": lag_slices,
+        # Conversation context (drives / explains `cache_prefix_unstable`).
+        "conversation_count": signals["conversation_count"],
+        "top_conversation_id": signals["top_conversation_id"],
+        "prefix_tokens": signals["prefix_tokens"],
+        "peak_prompt_tokens": signals["peak_prompt_tokens"],
         # Full signals block stored for later heuristic tuning / drill-in.
         "payload": {"signals": signals},
     }
@@ -595,6 +750,9 @@ def diagnose_lookback(
 def _mk(reason: str, *, actionable: bool = False, investigate: bool = False, summary: str) -> dict:
     return {
         "reason": reason,
+        # Signature = the winning *traffic shape* (None for an attribution
+        # verdict such as `unexplained` / `over_attributed`).
+        "signature": reason if reason in SIGNATURES else None,
         "actionable": actionable,
         "investigate": investigate,
         "summary": summary,

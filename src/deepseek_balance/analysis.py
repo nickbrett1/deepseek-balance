@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from . import analytics, heuristics
+from . import analytics, bursts, heuristics
 from .db import BalanceDB
 from .phoenix import PhoenixClient
 
@@ -39,6 +39,10 @@ DEFAULT_LOOKBACK_DAYS = 3          # how many complete days back to detect highs
 DEFAULT_PHOENIX_PAD_SECONDS = 60   # widen each interval before hitting Phoenix
 DEFAULT_MAX_DIAGNOSE_PER_RUN = 25  # cap on Phoenix dives per backfill pass
 DEFAULT_MAX_HIGH_TO_RECORD = 200   # cap on intervals recorded per pass
+# Burst reconciliation: one quiet slice inside a burst does not split it, and
+# the meter's observed settling lag is allowed for when attributing spans.
+DEFAULT_BURST_GAP_SLICES = 1
+DEFAULT_ATTRIBUTION_LAG_SLICES = 1
 
 
 def _int_env(name: str, default: int) -> int:
@@ -58,6 +62,7 @@ def _summary_kwargs() -> dict:
         "normal_band": _float_env("NORMAL_BAND", 2.0),
         "max_gap_minutes": _int_env("MAX_GAP_MINUTES", 30),
         "baseline_days": _int_env("BASELINE_DAYS", 14),
+        "burst_gap_slices": _int_env("BURST_GAP_SLICES", bursts.DEFAULT_GAP_SLICES),
     }
 
 
@@ -71,6 +76,12 @@ def _float_env(name: str, default: float) -> float:
 def _local_now() -> datetime:
     """Aware 'now' in the container's local timezone (TZ env)."""
     return datetime.now().astimezone()
+
+
+def _shift(iso: str, seconds: float) -> str:
+    """Shift an ISO timestamp by ``seconds`` (tz-aware), returning ISO."""
+    dt = datetime.fromisoformat(iso)
+    return (dt + timedelta(seconds=seconds)).isoformat()
 
 
 def _start_of_day(dt: datetime) -> datetime:
@@ -90,17 +101,38 @@ class AnalysisService:
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
         pad_seconds: int = DEFAULT_PHOENIX_PAD_SECONDS,
         max_diagnose_per_run: int = DEFAULT_MAX_DIAGNOSE_PER_RUN,
+        burst_gap_slices: int | None = None,
+        attribution_lag_slices: int | None = None,
     ) -> None:
         self.db = db
         self.phoenix = phoenix
         self.lookback_days = lookback_days
         self.pad_seconds = pad_seconds
         self.max_diagnose_per_run = max_diagnose_per_run
+        self.burst_gap_slices = (
+            burst_gap_slices
+            if burst_gap_slices is not None
+            else _int_env("BURST_GAP_SLICES", DEFAULT_BURST_GAP_SLICES)
+        )
+        self.attribution_lag_slices = (
+            attribution_lag_slices
+            if attribution_lag_slices is not None
+            else _int_env("ATTRIBUTION_LAG_SLICES", DEFAULT_ATTRIBUTION_LAG_SLICES)
+        )
 
     # --- detection ---------------------------------------------------------
 
-    def _detect_for_window(self, window_start_utc: datetime, window_end_utc: datetime, day: str) -> list[dict]:
-        """Return high intervals in [start, end) as [{start_utc, end_utc, spend, threshold, median}]."""
+    def _detect_bursts_for_window(
+        self, window_start_utc: datetime, window_end_utc: datetime, day: str
+    ) -> list[dict]:
+        """Detect bursts in [start, end).
+
+        Keeps the cheap slice scan (``analytics.spend_intervals``) and folds the
+        flagged slices into bursts (a run of high slices up to ``gap_slices``
+        apart, edge-expanded into a settle-tail slice, dropped below the spike
+        threshold). Returns one dict per burst with the bounds, merged spend and
+        the member-slice count the reconciler/classifier need.
+        """
         kwargs = _summary_kwargs()
         kwargs["spend_slice_minutes"] = _int_env("SPEND_SLICE_MINUTES", 5)
         si = analytics.spend_intervals(
@@ -109,31 +141,24 @@ class AnalysisService:
             summary_start_utc=window_start_utc,
             **kwargs,
         )
-        highs: list[dict] = []
-        slice_sec = si["slice_minutes"] * 60
+        slice_minutes = si["slice_minutes"]
         threshold = si["thresholds"].get("spike_threshold")
+        below_floor = si["thresholds"].get("below_floor")
         median = si["thresholds"].get("median")
-        for interval in si.get("intervals", []):
-            if interval.get("bucket") != "high":
-                continue
-            start_utc = interval["ts"]
-            try:
-                end_utc = (
-                    datetime.fromisoformat(start_utc) + timedelta(seconds=slice_sec)
-                ).isoformat()
-            except ValueError:
-                end_utc = start_utc
-            highs.append(
-                {
-                    "start_utc": start_utc,
-                    "end_utc": end_utc,
-                    "spend": interval["spend"],
-                    "threshold": threshold,
-                    "median": median,
-                    "day": day,
-                }
-            )
-        return highs
+        detected = bursts.assemble_bursts(
+            si.get("intervals", []),
+            slice_minutes=slice_minutes,
+            gap_slices=self.burst_gap_slices,
+            spike_threshold=threshold,
+            below_floor=below_floor,
+            lag_slices=self.attribution_lag_slices,
+        )
+        for b in detected:
+            b["slice_minutes"] = slice_minutes
+            b["threshold"] = threshold
+            b["median"] = median
+            b["day"] = day
+        return detected
 
     def _recorded(self, now: datetime) -> list[dict]:
         """Find and persist high intervals over the lookback window.
@@ -155,23 +180,28 @@ class AnalysisService:
             local_day = day_start.astimezone(tz)
             day_label = local_day.date().isoformat()
             candidates.extend(
-                self._detect_for_window(day_start, day_end, day_label)
+                self._detect_bursts_for_window(day_start, day_end, day_label)
             )
 
         # Today's already-closed intervals (anything whose slice has ended).
-        candidates.extend(self._detect_for_window(today_utc, now_utc, today_local.date().isoformat()))
+        candidates.extend(
+            self._detect_bursts_for_window(today_utc, now_utc, today_local.date().isoformat())
+        )
 
         recorded: list[dict] = []
         for c in candidates[: DEFAULT_MAX_HIGH_TO_RECORD]:
             self.db.record_high_interval(
                 start_utc=c["start_utc"],
                 end_utc=c["end_utc"],
-                slice_minutes=_int_env("SPEND_SLICE_MINUTES", 5),
+                slice_minutes=c.get("slice_minutes") or _int_env("SPEND_SLICE_MINUTES", 5),
                 spend=c["spend"],
                 spike_threshold=c["threshold"],
                 median_interval=c["median"],
                 day=c["day"],
                 detected_at=detected_at,
+                burst_id=c.get("burst_id") or c["start_utc"],
+                member_slice_count=c.get("member_slice_count"),
+                lag_slices=c.get("lag_slices", self.attribution_lag_slices),
             )
             recorded.append(self.db._high_row(c["start_utc"]))
         return [r for r in recorded if r]
@@ -214,23 +244,74 @@ class AnalysisService:
         diag.setdefault("prior_burst_end_utc", None)
         diag.setdefault("prior_burst_reason", None)
 
+    def _lag_slices(self, high: dict) -> int:
+        """Attribution lag for a burst row.
+
+        A recorded burst carries its own ``lag_slices`` (stamped at detection).
+        A bare interval dict with no burst identity — e.g. a slice diagnosed on
+        its own — is reconciled without a lag allowance.
+        """
+        if high.get("lag_slices") is not None:
+            return int(high["lag_slices"])
+        if high.get("burst_id"):
+            return self.attribution_lag_slices
+        return 0
+
+    def _owned_spans(self, spans: list[dict], high: dict, lag_slices: int) -> list[dict]:
+        """Keep only the spans this burst owns when lag windows overlap.
+
+        With a lag allowance two neighbouring bursts' padded windows can
+        overlap. Every span is attributed to the nearest burst (by start time)
+        so ``Σ burst_span_cost`` over a day never exceeds the trace total.
+        """
+        if lag_slices <= 0 or not spans:
+            return spans
+        slice_minutes = high.get("slice_minutes") or _int_env("SPEND_SLICE_MINUTES", 5)
+        lag_seconds = lag_slices * slice_minutes * 60
+        start = _shift(high["start_utc"], -lag_seconds)
+        end = _shift(high["end_utc"], lag_seconds)
+        neighbours = self.db.high_intervals_between(start, end)
+        if len(neighbours) <= 1:
+            return spans
+        windows = [
+            {"start_utc": r["start_utc"], "end_utc": r["end_utc"]} for r in neighbours
+        ]
+        owned, _ = bursts.assign_spans(
+            spans, windows, lag_slices=lag_slices, slice_minutes=slice_minutes
+        )
+        for i, w in enumerate(windows):
+            if w["start_utc"] == high["start_utc"]:
+                return owned.get(i, [])
+        return spans
+
     def _diagnose(self, high: dict) -> dict | None:
-        """Query Phoenix over the (widened) interval and classify it."""
+        """Query Phoenix over the (lag-widened) window and classify it."""
         if self.phoenix is None:
             return None
+        lag_slices = self._lag_slices(high)
+        slice_minutes = high.get("slice_minutes") or _int_env("SPEND_SLICE_MINUTES", 5)
+        lag_seconds = lag_slices * slice_minutes * 60
+        fetch_start = _shift(high["start_utc"], -lag_seconds)
+        fetch_end = _shift(high["end_utc"], lag_seconds)
         try:
             spans = self.phoenix.fetch_llm_spans(
-                high["start_utc"], high["end_utc"], pad_seconds=self.pad_seconds
+                fetch_start, fetch_end, pad_seconds=self.pad_seconds
             )
         except (httpx.HTTPError, OSError, ValueError) as exc:  # leave unanalyzed
             logger.warning("Phoenix fetch failed for %s: %s", high["start_utc"], exc)
             return None
+        spans = self._owned_spans(spans, high, lag_slices)
         window_spend = high["spend"] or 0.0
         diag = heuristics.diagnose(
             spans,
             window_spend=window_spend,
             window_start_utc=high["start_utc"],
             window_end_utc=high["end_utc"],
+            burst_id=high.get("burst_id"),
+            burst_start_utc=high["start_utc"],
+            burst_end_utc=high["end_utc"],
+            member_slice_count=high.get("member_slice_count") or 1,
+            lag_slices=lag_slices,
         )
 
         # One-interval lookback: an empty window may be a lagged settlement of

@@ -22,6 +22,8 @@ import statistics
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
+from . import bursts
+
 DAY_SECONDS = 86400.0
 
 # A "spend interval" is flagged as unusually high when it exceeds the robust
@@ -313,6 +315,7 @@ def spend_intervals(
     normal_band: float = 2.0,
     max_gap_minutes: int = 30,
     baseline_days: int = 14,
+    burst_gap_slices: int = bursts.DEFAULT_GAP_SLICES,
 ) -> dict:
     """Bucket spend into fixed intervals and classify each spent one.
 
@@ -428,6 +431,18 @@ def spend_intervals(
     def _pct(n: int) -> float | None:
         return (n / interval_count * 100) if interval_count else None
 
+    # Burst-level view of the same flagged slices: adjacent high slices (and
+    # their settle-tail) are one event. The detail table is per burst, so the
+    # headline count is reported both ways — slice count (legacy) and burst
+    # count — and they agree in the common one-slice case.
+    detected_bursts = bursts.assemble_bursts(
+        intervals,
+        slice_minutes=spend_slice_minutes,
+        gap_slices=burst_gap_slices,
+        spike_threshold=threshold,
+        below_floor=below_floor,
+    )
+
     return {
         "window_hours": window_hours,
         "slice_minutes": spend_slice_minutes,
@@ -447,6 +462,7 @@ def spend_intervals(
             "intervals_with_spend": interval_count,
             "unusually_high_count": high_count,
             "unusually_high_pct": _pct(high_count),
+            "unusually_high_burst_count": len(detected_bursts),
             "normal_count": buckets["normal"],
             "normal_pct": _pct(buckets["normal"]),
             "below_count": buckets["below"],
@@ -472,6 +488,7 @@ def daily_heartbeat(
     min_intervals_for_baseline: int = MIN_INTERVALS_FOR_BASELINE,
     normal_band: float = 2.0,
     baseline_days: int = 14,
+    burst_gap_slices: int = bursts.DEFAULT_GAP_SLICES,
 ) -> dict:
     """Compute the daily heartbeat summary relative to the moment `now`.
 
@@ -587,6 +604,7 @@ def daily_heartbeat(
         normal_band=normal_band,
         max_gap_minutes=max_gap_minutes,
         baseline_days=baseline_days,
+        burst_gap_slices=burst_gap_slices,
     )
     spend_summary = {
         "window_hours": si["window_hours"],
@@ -605,6 +623,7 @@ def daily_heartbeat(
         "below_floor": si["thresholds"]["below_floor"],
         "unusually_high_count": si["summary"]["unusually_high_count"],
         "unusually_high_pct": si["summary"]["unusually_high_pct"],
+        "unusually_high_burst_count": si["summary"]["unusually_high_burst_count"],
         "normal_count": si["summary"]["normal_count"],
         "normal_pct": si["summary"]["normal_pct"],
         "below_count": si["summary"]["below_count"],

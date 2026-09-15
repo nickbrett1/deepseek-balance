@@ -195,6 +195,8 @@ network and pointed at it:
 | `PHOENIX_WINDOW_PAD_SECONDS` | `60`                    | Widen each interval when querying Phoenix (traces bound on start). |
 | `ANALYSIS_INTERVAL`      | `10m`                       | Analysis job cadence (APScheduler). |
 | `MAX_DIAGNOSE_PER_RUN`   | `25`                        | Cap on Phoenix dives per pass (bounds query volume). |
+| `BURST_GAP_SLICES`       | `1`                         | Quiet slices tolerated *inside* a burst before it splits. |
+| `ATTRIBUTION_LAG_SLICES` | `1`                         | Slices of metering lag allowed when attributing spans to a burst. |
 
 Detection reuses the same robust-MAD spike rule (`analytics.spend_intervals`)
 over recent complete days in the **server's local timezone**, recording each
@@ -243,6 +245,49 @@ windows) and truly idle windows still reach `investigate`. Every diagnosis row
 also stores the balance snapshot pair (`balance_start`/`balance_end` and their
 timestamps) whose decline is `window_spend`, so the settlement lag is visible in
 the data rather than inferred from a separate history call.
+
+#### Burst-level reconciliation
+
+Classifying each 5-minute slice *in isolation* was the detector's defect: a
+single burst of spend can straddle a slice boundary, and because span cost is
+keyed on `start_time` while the balance delta is measured per slice, the cost
+lands in one slice and the money in two. The result was an over-attributed slice
+(e.g. 181% "explained", silently clamped) beside an under-attributed one that
+was loudly reported `unexplained` — when in fact the pair reconciles cleanly to
+~100%.
+
+The detector keeps the cheap slice scan, then **assembles slices into bursts and
+reconciles, classifies and reports at burst granularity**:
+
+- **Assembly** (`bursts.py`): a burst is a maximal run of high slices no more
+  than `BURST_GAP_SLICES` apart (so one quiet slice inside a burst does not
+  split it). The run is edge-expanded by one slice on each side when that
+  neighbour still carries spend above the `below_floor`, folding the meter's
+  settle-tail into the burst that caused it, and dropped when its combined delta
+  does not reach the spike threshold.
+- **Attribution**: span cost is summed over the burst's window padded by
+  `ATTRIBUTION_LAG_SLICES` on each side. Every span belongs to exactly one
+  burst — where padded windows overlap, the nearest burst (by `start_time`)
+  wins, so `Σ burst_span_cost` over a day never exceeds the trace total.
+- **Classification**: attribution health is a band — `explained < 0.5` is
+  `unexplained` (investigate), `0.5–2.0` is attributed, `> 2.0` is
+  `over_attributed` (investigate: a double count or lag beyond the window,
+  surfaced rather than clamped). An attributed burst then picks a dominant
+  **signature**.
+
+New labels: **`over_attributed`**, **`cache_prefix_unstable`** (one
+conversation whose context grows turn over turn while `cache_read` stays pinned
+near the system-prompt size — the agent tool-loop that motivated this, reported
+with `prefix_tokens` / `peak_prompt_tokens`), and **`tool_call_loop`**.
+`unexplained` now means what it says: cost genuinely absent from the trace store
+after the lag window, not a boundary artifact.
+
+Each table row is one **burst** carrying `burst_id`, `burst_start_utc` /
+`burst_end_utc`, `burst_spend`, `member_slice_count`,
+`reconciled_cost_lag_slices` and `signature` (the actionable finding, separate
+from `reason`). Per-slice rows are retained under the burst (a slice is never
+judged alone). The `spend_summary` / `today_summary` counters report the burst
+count (`unusually_high_burst_count`) alongside the legacy slice count.
 
 Endpoints: `GET /analysis/high-intervals` (paged table, newest first, `before`
 cursor for paging back) and `POST /analysis/backfill` (run a pass on demand).

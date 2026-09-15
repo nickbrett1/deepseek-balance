@@ -42,7 +42,13 @@ CREATE TABLE IF NOT EXISTS high_intervals (
   spike_threshold REAL,           -- median + SPIKE_MULT*MAD used (audit)
   median_interval REAL,
   day TEXT,                       -- local day (server TZ) the interval fell in
-  detected_at TEXT                -- when we first recorded it (UTC)
+  detected_at TEXT,               -- when we first recorded it (UTC)
+  -- Burst view of this row (see the burst-reconciliation memo): a row is one
+  -- burst, keyed by its first slice's start. `lag_slices` is the attribution
+  -- lag the reconciler allowed when it reconciled this burst.
+  burst_id TEXT,
+  member_slice_count INTEGER,
+  lag_slices INTEGER
 );
 
 -- The Phoenix-trace diagnosis for a high interval. Keyed by the same UTC
@@ -77,7 +83,21 @@ CREATE TABLE IF NOT EXISTS interval_diagnostics (
   balance_end REAL,               -- total_balance at balance_end_ts
   prior_burst_start_utc TEXT,     -- referenced prior burst window (settlement lag)
   prior_burst_end_utc TEXT,
-  prior_burst_reason TEXT         -- the burst's own primary reason
+  prior_burst_reason TEXT,        -- the burst's own primary reason
+  -- Burst-level reconciliation: a row is one burst (or a one-member burst when
+  -- detection had no neighbours to fold in). `signature` is the actionable
+  -- traffic shape, separable from the attribution-health `reason`.
+  burst_id TEXT,
+  burst_start_utc TEXT,
+  burst_end_utc TEXT,
+  burst_spend REAL,               -- merged delta over the burst's member slices
+  member_slice_count INTEGER,     -- slices folded into this burst
+  reconciled_cost_lag_slices INTEGER,  -- lag (in slices) allowed when attributing spans
+  signature TEXT,
+  conversation_count INTEGER,
+  top_conversation_id TEXT,
+  prefix_tokens REAL,             -- modal prompt-cache size (cache_prefix_unstable)
+  peak_prompt_tokens REAL         -- largest prompt seen in the conversation
 );
 """
 
@@ -113,6 +133,17 @@ class BalanceDB:
         ("pricing_band", "TEXT"),
         ("peak_overlap_minutes", "REAL"),
         ("peak_premium_usd", "REAL"),
+        ("signature", "TEXT"),
+        ("burst_id", "TEXT"),
+        ("burst_start_utc", "TEXT"),
+        ("burst_end_utc", "TEXT"),
+        ("burst_spend", "REAL"),
+        ("member_slice_count", "INTEGER"),
+        ("reconciled_cost_lag_slices", "INTEGER"),
+        ("conversation_count", "INTEGER"),
+        ("top_conversation_id", "TEXT"),
+        ("prefix_tokens", "REAL"),
+        ("peak_prompt_tokens", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -123,6 +154,18 @@ class BalanceDB:
                 self._conn.execute(
                     "ALTER TABLE balance_snapshots ADD COLUMN scheduled_ts TEXT"
                 )
+            interval_cols = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(high_intervals)")
+            }
+            for name, decl in (
+                ("burst_id", "TEXT"),
+                ("member_slice_count", "INTEGER"),
+                ("lag_slices", "INTEGER"),
+            ):
+                if name not in interval_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE high_intervals ADD COLUMN {name} {decl}"
+                    )
             diag_cols = {
                 r["name"]
                 for r in self._conn.execute("PRAGMA table_info(interval_diagnostics)")
@@ -192,26 +235,34 @@ class BalanceDB:
         median_interval: float | None,
         day: str,
         detected_at: str,
+        burst_id: str | None = None,
+        member_slice_count: int | None = None,
+        lag_slices: int | None = None,
     ) -> None:
-        """Idempotently record one unusually-high interval (upsert on start)."""
+        """Idempotently record one unusually-high interval / burst (upsert on start)."""
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO high_intervals (
                   start_utc, end_utc, slice_minutes, spend,
-                  spike_threshold, median_interval, day, detected_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  spike_threshold, median_interval, day, detected_at,
+                  burst_id, member_slice_count, lag_slices
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(start_utc) DO UPDATE SET
                   end_utc=excluded.end_utc,
                   slice_minutes=excluded.slice_minutes,
                   spend=excluded.spend,
                   spike_threshold=excluded.spike_threshold,
                   median_interval=excluded.median_interval,
-                  day=excluded.day
+                  day=excluded.day,
+                  burst_id=excluded.burst_id,
+                  member_slice_count=excluded.member_slice_count,
+                  lag_slices=excluded.lag_slices
                 """,
                 (
                     start_utc, end_utc, slice_minutes, spend,
                     spike_threshold, median_interval, day, detected_at,
+                    burst_id, member_slice_count, lag_slices,
                 ),
             )
             self._conn.commit()
@@ -236,6 +287,24 @@ class BalanceDB:
                 ORDER BY h.start_utc DESC LIMIT ?
                 """,
                 (since_utc, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def high_intervals_between(self, start_utc: str, end_utc: str) -> list[dict]:
+        """Recorded high intervals overlapping ``[start_utc, end_utc]``.
+
+        Used when a burst's lag-padded Phoenix window needs the neighbouring
+        bursts so a span that falls in two overlapping windows is attributed to
+        the nearest one (never double counted).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM high_intervals
+                WHERE end_utc >= ? AND start_utc <= ?
+                ORDER BY start_utc ASC
+                """,
+                (start_utc, end_utc),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -331,6 +400,20 @@ class BalanceDB:
                     "prior_burst_start_utc": r.pop("prior_burst_start_utc", None),
                     "prior_burst_end_utc": r.pop("prior_burst_end_utc", None),
                     "prior_burst_reason": r.pop("prior_burst_reason", None),
+                    # Burst-level reconciliation (see the memo): the row is one
+                    # burst, reconciled with a lag allowance, labelled by the
+                    # actionable `signature` as well as the health `reason`.
+                    "signature": r.pop("signature", None),
+                    "burst_id": r.pop("burst_id", None),
+                    "burst_start_utc": r.pop("burst_start_utc", None),
+                    "burst_end_utc": r.pop("burst_end_utc", None),
+                    "burst_spend": r.pop("burst_spend", None),
+                    "member_slice_count": r.pop("member_slice_count", None),
+                    "reconciled_cost_lag_slices": r.pop("reconciled_cost_lag_slices", None),
+                    "conversation_count": r.pop("conversation_count", None),
+                    "top_conversation_id": r.pop("top_conversation_id", None),
+                    "prefix_tokens": r.pop("prefix_tokens", None),
+                    "peak_prompt_tokens": r.pop("peak_prompt_tokens", None),
                 }
             out.append(
                 {
@@ -410,6 +493,17 @@ class BalanceDB:
                         "prior_burst_start_utc": r["prior_burst_start_utc"],
                         "prior_burst_end_utc": r["prior_burst_end_utc"],
                         "prior_burst_reason": r["prior_burst_reason"],
+                        "signature": r.get("signature"),
+                        "burst_id": r.get("burst_id"),
+                        "burst_start_utc": r.get("burst_start_utc"),
+                        "burst_end_utc": r.get("burst_end_utc"),
+                        "burst_spend": r.get("burst_spend"),
+                        "member_slice_count": r.get("member_slice_count"),
+                        "reconciled_cost_lag_slices": r.get("reconciled_cost_lag_slices"),
+                        "conversation_count": r.get("conversation_count"),
+                        "top_conversation_id": r.get("top_conversation_id"),
+                        "prefix_tokens": r.get("prefix_tokens"),
+                        "peak_prompt_tokens": r.get("peak_prompt_tokens"),
                         "signals": signals,
                     },
                 }
@@ -445,9 +539,14 @@ class BalanceDB:
                   output_tokens, cache_hit_ratio, error_count, tool_call_count,
                   top_models, summary, payload, analyzed_at,
                   balance_start_ts, balance_start, balance_end_ts, balance_end,
-                  prior_burst_start_utc, prior_burst_end_utc, prior_burst_reason
+                  prior_burst_start_utc, prior_burst_end_utc, prior_burst_reason,
+                  signature, burst_id, burst_start_utc, burst_end_utc, burst_spend,
+                  member_slice_count, reconciled_cost_lag_slices,
+                  conversation_count, top_conversation_id,
+                  prefix_tokens, peak_prompt_tokens
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?)
                 ON CONFLICT(start_utc) DO UPDATE SET
                   reason=excluded.reason,
                   reason_label=excluded.reason_label,
@@ -477,7 +576,18 @@ class BalanceDB:
                   balance_end=excluded.balance_end,
                   prior_burst_start_utc=excluded.prior_burst_start_utc,
                   prior_burst_end_utc=excluded.prior_burst_end_utc,
-                  prior_burst_reason=excluded.prior_burst_reason
+                  prior_burst_reason=excluded.prior_burst_reason,
+                  signature=excluded.signature,
+                  burst_id=excluded.burst_id,
+                  burst_start_utc=excluded.burst_start_utc,
+                  burst_end_utc=excluded.burst_end_utc,
+                  burst_spend=excluded.burst_spend,
+                  member_slice_count=excluded.member_slice_count,
+                  reconciled_cost_lag_slices=excluded.reconciled_cost_lag_slices,
+                  conversation_count=excluded.conversation_count,
+                  top_conversation_id=excluded.top_conversation_id,
+                  prefix_tokens=excluded.prefix_tokens,
+                  peak_prompt_tokens=excluded.peak_prompt_tokens
                 """,
                 (
                     start_utc,
@@ -510,6 +620,17 @@ class BalanceDB:
                     diag.get("prior_burst_start_utc"),
                     diag.get("prior_burst_end_utc"),
                     diag.get("prior_burst_reason"),
+                    diag.get("signature"),
+                    diag.get("burst_id"),
+                    diag.get("burst_start_utc"),
+                    diag.get("burst_end_utc"),
+                    diag.get("burst_spend"),
+                    diag.get("member_slice_count"),
+                    diag.get("reconciled_cost_lag_slices"),
+                    diag.get("conversation_count"),
+                    diag.get("top_conversation_id"),
+                    diag.get("prefix_tokens"),
+                    diag.get("peak_prompt_tokens"),
                 ),
             )
             self._conn.commit()
