@@ -200,12 +200,37 @@ Detection reuses the same robust-MAD spike rule (`analytics.spend_intervals`)
 over recent complete days in the **server's local timezone**, recording each
 flagged interval once. For each it pulls LLM spans over the window and classifies
 the cause with a deterministic, ordered heuristic (`heuristics.py`): it first
-reconciles Σ `litellm.cost.total` against the interval's balance drop (both USD)
-and, if the traces can't account for the spend, flags the interval
+reconciles the interval's balance drop against the cost its tokens *should* have
+incurred and, if the traces can't account for the spend, flags the interval
 `unexplained → investigate` rather than inventing a cause. Actionable reasons
 include tool-call loops, bloated (cache-miss) contexts, a single dominant
 request, errors/retries, and high-concurrency cache misses; well-cached high
 activity is marked benign (not an optimisation candidate).
+
+#### Peak vs off-peak pricing
+
+DeepSeek bills two bands: **peak hours are 01:00-04:00 and 06:00-10:00 UTC,
+Monday-Friday**, and every other hour costs *half* the peak rate
+(`pricing.py`). LiteLLM's price for these models is a single flat figure that
+equals the **peak** column — so `litellm.cost.total` charges the peak rate
+unconditionally, and an off-peak window is traced at ~2x the truth.
+
+The reconciliation therefore compares the balance drop against
+`reconciled_cost_expected` — the window's token counts priced at the published
+rate for the band each request actually ran in (band per span from its start
+time, falling back to the band covering most of the window) — and keeps
+LiteLLM's figure as `reconciled_cost_litellm` for reference. The gap between
+them (`flat_peak_overstatement_usd`) is the flat-peak bug, surfaced rather than
+silently mixed in.
+
+Every diagnosis carries a `pricing` block: the window's `band`
+(`peak` / `off_peak` / `mixed`), `peak_overlap_minutes`, and
+`peak_premium_usd` (what the 2x band added over off-peak rates for the same
+tokens). When the premium is material and no traffic-shape rule fits, the
+window is labelled `peak_pricing` ("Peak-hour rate (2x off-peak)"); when another
+reason wins, the premium is appended to that summary instead. Prices are per
+model and come from the published table, verified against LiteLLM's own price
+map.
 
 Because balances are polled on a grid and cent-quantized, a burst's charges can
 settle up to ~one snapshot interval *after* the tokens were consumed, landing a

@@ -18,7 +18,7 @@ from deepseek_balance.phoenix import PhoenixClient, attr, span_metrics
 # --- span helpers -----------------------------------------------------------
 
 def _span(model="deepseek-chat", *, input=1000, output=200, cached=0, cost=0.1,
-          finish="stop", status="OK", error=False):
+          finish="stop", status="OK", error=False, start=None):
     attributes = {
         "gen_ai.response.model": model,
         "gen_ai.usage.input_tokens": input,
@@ -29,12 +29,15 @@ def _span(model="deepseek-chat", *, input=1000, output=200, cached=0, cost=0.1,
     }
     if cached:
         attributes["gen_ai.usage.cache_read.input_tokens"] = cached
-    return {
+    span = {
         "name": "chat deepseek-chat",
         "span_kind": "LLM",
         "status_code": "ERROR" if error else status,
         "attributes": attributes,
     }
+    if start is not None:
+        span["start_time"] = start
+    return span
 
 
 # --- attribute helpers ------------------------------------------------------
@@ -58,6 +61,19 @@ def test_span_metrics_cache_uncached():
 
 # --- heuristics: reconciliation first ---------------------------------------
 
+def _reconciled(spans, *, start=None, end=None):
+    """The band-correct cost of these spans — i.e. the drop they explain.
+
+    The taxonomy tests below use this so the balance drop is exactly what the
+    window's tokens cost at DeepSeek's published band rates, which is what the
+    classifier reconciles against (a hand-picked drop would otherwise be judged
+    against a different pricing model than the fixtures assume).
+    """
+    return heuristics.summarize(
+        spans, window_spend=0.0, window_start_utc=start, window_end_utc=end
+    )["reconciled_cost"]
+
+
 def test_diagnose_no_spans_is_unexplained_investigate():
     diag = heuristics.diagnose([], window_spend=5.0)
     assert diag["reason"] == "unexplained"
@@ -78,7 +94,7 @@ def test_diagnose_cost_mismatch_is_unexplained():
 
 def test_benign_high_activity_cached():
     spans = [_span(cost=0.2, input=5000, cached=4800, output=100) for _ in range(30)]
-    diag = heuristics.diagnose(spans, window_spend=6.0)
+    diag = heuristics.diagnose(spans, window_spend=_reconciled(spans))
     assert diag["reason"] == "high_activity_cached"
     assert diag["actionable"] is False
     assert diag["investigate"] is False
@@ -118,7 +134,7 @@ def test_cent_quantization_not_benign_without_cache_heavy_traffic():
 
 def test_tool_call_loop():
     spans = [_span(finish="tool_calls", cost=0.5, output=300) for _ in range(6)]
-    diag = heuristics.diagnose(spans, window_spend=3.0)
+    diag = heuristics.diagnose(spans, window_spend=_reconciled(spans))
     assert diag["reason"] == "tool_call_loop"
     assert diag["actionable"] is True
 
@@ -126,7 +142,7 @@ def test_tool_call_loop():
 def test_bloated_context():
     # Many requests each with a huge uncached prompt and small output.
     spans = [_span(input=300_000, cached=0, output=200, cost=1.0) for _ in range(4)]
-    diag = heuristics.diagnose(spans, window_spend=4.0)
+    diag = heuristics.diagnose(spans, window_spend=_reconciled(spans))
     assert diag["reason"] == "bloated_context"
     assert diag["actionable"] is True
 
@@ -134,7 +150,7 @@ def test_bloated_context():
 def test_expensive_single_request():
     spans = [_span(cost=0.01, input=100, output=50) for _ in range(20)]
     spans.append(_span(cost=8.0, input=2000, output=4000))
-    diag = heuristics.diagnose(spans, window_spend=8.5)
+    diag = heuristics.diagnose(spans, window_spend=_reconciled(spans))
     assert diag["reason"] == "expensive_single_request"
     assert diag["actionable"] is True
 
@@ -142,7 +158,7 @@ def test_expensive_single_request():
 def test_errors_retries():
     spans = [_span(error=True, cost=0.3) for _ in range(3)]
     spans += [_span(cost=0.3) for _ in range(2)]
-    diag = heuristics.diagnose(spans, window_spend=1.5)
+    diag = heuristics.diagnose(spans, window_spend=_reconciled(spans))
     assert diag["reason"] == "errors_retries"
     assert diag["actionable"] is True
 
@@ -151,9 +167,172 @@ def test_all_reasons_have_labels():
     for key in (
         "tool_call_loop", "bloated_context", "expensive_single_request",
         "errors_retries", "high_concurrency_cache_miss", "large_output",
+        "peak_pricing",
         "high_activity_cached", "cent_quantized", "unexplained",
     ):
         assert key in REASONS
+
+
+# --- pricing: band-correct reconciliation + peak annotation -----------------
+#
+# The fixtures below are the memo's reconstruction of two windows: the same
+# token mix (447,616 cache-hit / 409,435 cache-miss / 11,002 output) in an
+# off-peak window and in a peak window. DeepSeek's published rates make those
+# tokens cost $0.0693593 off-peak and $0.1387186 at peak, and LiteLLM's flat
+# price records the *peak* figure in both cases.
+
+_MEMO_TOKENS = {"input": 857_051, "cached": 447_616, "output": 11_002, "cost": 0.1387186}
+_MEMO_OFFPEAK = 0.0693593      # published off-peak cost of that token mix
+_MEMO_PEAK = 0.1387186         # published peak cost == litellm.cost.total
+
+# Sunday 19:35 UTC (off-peak) and Tuesday 01:05 UTC (inside a peak band).
+_OFFPEAK_WINDOW = ("2026-09-13T19:35:00+00:00", "2026-09-13T19:40:00+00:00")
+_PEAK_WINDOW = ("2026-09-15T01:05:00+00:00", "2026-09-15T01:10:00+00:00")
+
+
+def test_off_peak_window_prices_at_off_peak_rates():
+    """Acceptance: off-peak traces reconcile to the drop at off-peak rates.
+
+    Previously they were 2x high (litellm's flat peak price), which is what
+    inflated `explained_cost_pct` across the board.
+    """
+    start, end = _OFFPEAK_WINDOW
+    diag = heuristics.diagnose(
+        [_span(**_MEMO_TOKENS)], window_spend=_MEMO_OFFPEAK,
+        window_start_utc=start, window_end_utc=end,
+    )
+    assert diag["reconciled_cost_expected"] == pytest.approx(_MEMO_OFFPEAK, abs=1e-6)
+    assert diag["reconciled_cost_litellm"] == pytest.approx(_MEMO_PEAK, abs=1e-6)
+    assert diag["explained_cost_pct"] == pytest.approx(100.0)
+    assert diag["pricing_band"] == "off_peak"
+    assert diag["peak_overlap_minutes"] == 0.0
+    assert diag["peak_premium_usd"] == 0.0
+    # The flat-peak bug: the tracer charged the peak figure off-peak.
+    assert diag["reconciled_cost_litellm"] == pytest.approx(2 * diag["reconciled_cost"])
+    assert diag["reason"] != "unexplained"
+
+
+def test_peak_window_prices_at_peak_rates():
+    start, end = _PEAK_WINDOW
+    diag = heuristics.diagnose(
+        [_span(**_MEMO_TOKENS)], window_spend=_MEMO_PEAK,
+        window_start_utc=start, window_end_utc=end,
+    )
+    assert diag["reconciled_cost_expected"] == pytest.approx(_MEMO_PEAK, abs=1e-6)
+    assert diag["reconciled_cost_litellm"] == pytest.approx(_MEMO_PEAK, abs=1e-6)
+    assert diag["pricing_band"] == "peak"
+    assert diag["peak_overlap_minutes"] == pytest.approx(5.0)
+    # The whole window is peak, so the premium is exactly the 2x uplift.
+    assert diag["peak_premium_usd"] == pytest.approx(_MEMO_OFFPEAK, abs=1e-6)
+
+
+def test_boundary_straddling_window_splits_by_span_time():
+    """A window that straddles 01:00 UTC is priced per span, not wholesale."""
+    start, end = "2026-09-15T00:57:00+00:00", "2026-09-15T01:02:00+00:00"
+    tokens = {"input": 1_000_000, "cached": 1_000_000, "output": 0}
+    spans = [
+        _span(start="2026-09-15T00:58:00+00:00", **tokens),  # off-peak
+        _span(start="2026-09-15T01:01:00+00:00", **tokens),  # peak
+    ]
+    spend = heuristics.summarize(
+        spans, window_spend=0.0, window_start_utc=start, window_end_utc=end
+    )["reconciled_cost"]
+    diag = heuristics.diagnose(
+        spans, window_spend=spend, window_start_utc=start, window_end_utc=end
+    )
+    off_peak_cost = 1_000_000 * 0.003 / 1e6      # cache-hit, off-peak
+    peak_cost = 1_000_000 * 0.006 / 1e6          # cache-hit, peak
+    assert diag["pricing_band"] == "mixed"
+    assert diag["peak_overlap_minutes"] == pytest.approx(2.0)
+    assert diag["reconciled_cost_expected"] == pytest.approx(off_peak_cost + peak_cost)
+    assert diag["peak_premium_usd"] == pytest.approx(peak_cost - off_peak_cost)
+    # The window's cost is bracketed by all-off-peak and all-peak pricing.
+    assert off_peak_cost * 2 < diag["reconciled_cost_expected"] < peak_cost * 2
+
+
+def test_peak_pricing_reason_when_peak_is_the_only_story():
+    """A window whose only story is the 2x band is labelled `peak_pricing`."""
+    start, end = _PEAK_WINDOW
+    spans = [_span(input=80_000, cached=72_000, output=0) for _ in range(10)]
+    spend = heuristics.summarize(
+        spans, window_spend=0.0, window_start_utc=start, window_end_utc=end
+    )["reconciled_cost"]
+    diag = heuristics.diagnose(
+        spans, window_spend=spend, window_start_utc=start, window_end_utc=end
+    )
+    assert diag["reason"] == "peak_pricing"
+    assert diag["reason_label"] == REASONS["peak_pricing"]
+    assert diag["investigate"] is False
+    assert diag["pricing_band"] == "peak"
+    # cache-hit 720k @ $0.006 + cache-miss 80k @ $0.30 per 1M, peak; the
+    # premium is the same tokens priced off-peak.
+    assert diag["peak_premium_usd"] == pytest.approx(0.01416, abs=1e-6)
+    assert "peak" in diag["summary"].lower()
+
+
+def test_peak_premium_annotated_when_another_reason_wins():
+    """A real burst still gets its shape, with the peak premium named alongside."""
+    start, end = _PEAK_WINDOW
+    spans = [_span(input=5000, cached=2400, output=0) for _ in range(30)]
+    spend = heuristics.summarize(
+        spans, window_spend=0.0, window_start_utc=start, window_end_utc=end
+    )["reconciled_cost"]
+    diag = heuristics.diagnose(
+        spans, window_spend=spend, window_start_utc=start, window_end_utc=end
+    )
+    # 30 requests at 48% cache -> the concurrency signature wins...
+    assert diag["reason"] == "high_concurrency_cache_miss"
+    # ...but the 2x premium is not hidden.
+    assert diag["peak_premium_usd"] == pytest.approx(0.011916, abs=1e-6)
+    assert "2x peak-hour premium" in diag["summary"]
+
+
+def test_peak_boundary_cent_scale_shortfall_is_a_measurement_floor():
+    """The 21:05-style slice: a cache-light slice whose drop overshoots traced
+    cost by cents *at a peak boundary* is noise, not lost spend."""
+    start, end = "2026-09-15T01:05:00+00:00", "2026-09-15T01:10:00+00:00"
+    spans = [_span(input=8500, cached=3900, output=890, cost=0.028183)
+             for _ in range(12)]
+    diag = heuristics.diagnose(
+        spans, window_spend=0.06, window_start_utc=start, window_end_utc=end
+    )
+    assert diag["reason"] == "cent_quantized"
+    assert diag["investigate"] is False
+    assert diag["pricing_band"] == "peak"
+
+
+def test_same_shortfall_off_peak_still_investigates():
+    """The floor above is scoped to the peak boundary — elsewhere a cache-light
+    cent-scale shortfall stays "investigate"."""
+    start, end = _OFFPEAK_WINDOW
+    spans = [_span(input=8500, cached=3900, output=890, cost=0.028183)
+             for _ in range(12)]
+    diag = heuristics.diagnose(
+        spans, window_spend=0.06, window_start_utc=start, window_end_utc=end
+    )
+    assert diag["reason"] == "unexplained"
+    assert diag["investigate"] is True
+
+
+def test_peak_pricing_round_trips_through_the_db(tmp_path):
+    """The pricing block survives storage and the read paths."""
+    db = BalanceDB(str(tmp_path / "peak.db"))
+    start, end = _OFFPEAK_WINDOW
+    diag = heuristics.diagnose(
+        [_span(**_MEMO_TOKENS)], window_spend=_MEMO_OFFPEAK,
+        window_start_utc=start, window_end_utc=end,
+    )
+    db.record_high_interval(
+        start_utc=start, end_utc=end, slice_minutes=5, spend=_MEMO_OFFPEAK,
+        spike_threshold=0.02, median_interval=0.01, day="2026-09-13",
+        detected_at=start,
+    )
+    db.upsert_diagnostic(start_utc=start, diag=diag)
+    rows, _ = db.high_intervals_with_diagnostics(limit=10)
+    got = rows[0]["diagnosis"]
+    assert got["pricing_band"] == "off_peak"
+    assert got["reconciled_cost_litellm"] == pytest.approx(_MEMO_PEAK, abs=1e-6)
+    assert got["peak_premium_usd"] == 0.0
 
 
 # --- Phoenix client (paginated fetch over a stubbed transport) --------------
@@ -390,7 +569,7 @@ def test_lookback_attributes_empty_window_to_prior_burst():
     prior = [_span(cost=0.03, input=5000, cached=1000, output=200) for _ in range(3)]
     diag = heuristics.diagnose_lookback(
         prior,
-        window_spend=0.06,
+        window_spend=_reconciled(prior),
         prior_start_utc="2026-09-11T13:10:00+00:00",
         prior_end_utc="2026-09-11T13:15:00+00:00",
     )
@@ -475,7 +654,7 @@ def test_analysis_empty_window_settles_from_prior_burst(tmp_path):
         "2026-09-11T13:15:00+00:00", "2026-09-11T13:20:00+00:00", 4.67, 4.61,
     )
     phoenix = _WindowPhoenix(
-        {"2026-09-11T13:10:00": [_span(cost=0.04, input=5000, cached=1000, output=200)
+        {"2026-09-11T13:10:00": [_span(cost=0.04, input=5000, cached=1000, output=20_000)
                                  for _ in range(3)]}
     )
     svc = AnalysisService(db, phoenix, lookback_days=1)
@@ -550,20 +729,17 @@ def test_analysis_populated_cent_floor_still_cent_quantized(tmp_path):
 def test_analysis_populated_window_unchanged(tmp_path):
     """T3d: a normal populated window is untouched by the lookback."""
     db = BalanceDB(str(tmp_path / "pop.db"))
-    _pair_snapshots(
-        db,
-        "2026-09-07T10:00:00+00:00", "2026-09-07T10:05:00+00:00", 5.00, 4.50,
-    )
-    phoenix = _WindowPhoenix(
-        {"2026-09-07T10:00:00": [_span(cost=0.2, input=5000, cached=4800, output=100)
-                                 for _ in range(30)]}
-    )
+    start, end = "2026-09-07T10:00:00+00:00", "2026-09-07T10:05:00+00:00"
+    spans = [_span(cost=0.2, input=5000, cached=4800, output=100) for _ in range(30)]
+    spend = _reconciled(spans, start=start, end=end)
+    _pair_snapshots(db, start, end, 5.00, 5.00 - spend)
+    phoenix = _WindowPhoenix({"2026-09-07T10:00:00": spans})
     svc = AnalysisService(db, phoenix, lookback_days=1)
     high = {
-        "start_utc": "2026-09-07T10:00:00+00:00",
-        "end_utc": "2026-09-07T10:05:00+00:00",
+        "start_utc": start,
+        "end_utc": end,
         "slice_minutes": 5,
-        "spend": 6.0,
+        "spend": spend,
     }
     diag = svc._diagnose(high)
     assert diag["reason"] == "high_activity_cached"

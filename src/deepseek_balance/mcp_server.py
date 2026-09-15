@@ -109,8 +109,8 @@ server = MCPServer(
         "`bucket` ('high' | 'normal' | 'below'). When following up on a heavy "
         "period, use `high_interval_diagnoses` to see why unusually-high "
         "intervals were flagged (Phoenix-trace reasons: actionable candidates, "
-        "benign well-cached activity, or 'investigate' where the spend wasn't "
-        "explained)."
+        "benign well-cached activity, peak_pricing where the 2x peak-hour rate "
+        "is the story, or 'investigate' where the spend wasn't explained)."
     ),
 )
 
@@ -199,10 +199,16 @@ def high_interval_diagnoses(
     (real optimisation candidates), investigate (spend Phoenix couldn't
     explain), benign (well-cached high activity - not candidates), or pending
     (recorded but not yet analysed). Pass `reason` to filter by the exact
-    reason key (e.g. 'bloated_context', 'tool_call_loop'). Set
+    reason key (e.g. 'bloated_context', 'tool_call_loop', 'peak_pricing'). Set
     `include_signals` to add the raw per-window token/cost signals for deep
     investigation. Timestamps are given in both UTC and the server's local
     timezone (`timezone`).
+
+    Each entry also carries the DeepSeek pricing band the window fell in
+    (`pricing_band`), `peak_overlap_minutes`, and `peak_premium_usd` — the
+    extra the 2x peak rate added over off-peak rates for the same tokens.
+    `reconciled_cost` is token-derived at that band; `reconciled_cost_litellm`
+    is the tracer's flat (peak-rate) figure kept for reference.
     """
     if status not in ("all", "actionable", "investigate", "benign", "pending"):
         raise ValueError("status must be one of: all, actionable, investigate, benign, pending")
@@ -245,6 +251,10 @@ def high_interval_diagnoses(
                     "investigate": diag["investigate"],
                     "summary": diag["summary"],
                     "reconciled_cost": diag["reconciled_cost"],
+                    "reconciled_cost_litellm": diag.get("reconciled_cost_litellm"),
+                    "pricing_band": diag.get("pricing_band"),
+                    "peak_overlap_minutes": diag.get("peak_overlap_minutes"),
+                    "peak_premium_usd": diag.get("peak_premium_usd"),
                     "explained_cost_pct": diag["explained_cost_pct"],
                     "request_count": diag["request_count"],
                     "cache_read_tokens": diag["cache_read_tokens"],

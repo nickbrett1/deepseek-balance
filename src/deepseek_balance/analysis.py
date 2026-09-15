@@ -226,7 +226,12 @@ class AnalysisService:
             logger.warning("Phoenix fetch failed for %s: %s", high["start_utc"], exc)
             return None
         window_spend = high["spend"] or 0.0
-        diag = heuristics.diagnose(spans, window_spend=window_spend)
+        diag = heuristics.diagnose(
+            spans,
+            window_spend=window_spend,
+            window_start_utc=high["start_utc"],
+            window_end_utc=high["end_utc"],
+        )
 
         # One-interval lookback: an empty window may be a lagged settlement of
         # the preceding interval's burst (T1). Only attempted when the window

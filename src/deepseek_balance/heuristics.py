@@ -9,19 +9,30 @@ first-version output is stable and easy to iterate on. It produces:
 
 - aggregate ``signals`` (request count, token/cache breakdown, errors, tool
   calls, per-model cost) — the raw facts, stored so later tuning is cheap;
+- a ``pricing`` block: the DeepSeek band the window fell in, how many minutes of
+  it were peak-priced, and the peak premium in dollars;
 - a primary ``reason`` (machine key) + ``reason_label`` chosen by precedence;
 - an ``actionable`` flag and an ``investigate`` flag.
 
 The reconciliation between the balance drop (``window_spend``) and the traced
-LLM cost (``litellm.cost.total`` summed over the window) is done first: if the
-traces can't account for the spend, the honest answer is "unexplained —
-investigate", not a made-up cause.
+LLM cost is done first: if the traces can't account for the spend, the honest
+answer is "unexplained — investigate", not a made-up cause.
+
+The reconciliation compares the drop against **``reconciled_cost_expected``** —
+what the window's token counts cost at the DeepSeek rate for the band each
+request actually ran in (see ``pricing.py``) — not against LiteLLM's flat
+``litellm.cost.total``, which *always* charges the peak rate. The litellm
+figure is kept as ``reconciled_cost_litellm`` for reference, and the gap between
+them is surfaced as ``flat_peak_overstatement_usd``: in off-peak windows the
+tracer is ~2x high, which is what skewed earlier reconciliation.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+
+from . import pricing
 
 # Reason keys and their human labels.
 REASONS: dict[str, str] = {
@@ -31,8 +42,9 @@ REASONS: dict[str, str] = {
     "errors_retries": "Errors / retries inflating spend",
     "high_concurrency_cache_miss": "High concurrency with cache misses",
     "large_output": "Unusually large output generation",
+    "peak_pricing": "Peak-hour rate (2x off-peak)",
     "high_activity_cached": "High activity — mostly cache hits / normal context",
-    "cent_quantized": "Cent-quantized balance drop on cache-heavy traffic (measurement floor)",
+    "cent_quantized": "Cent-quantized balance drop (measurement floor)",
     "settled_from_prior_burst": "Settled from prior burst (balance-snapshot lag)",
     "unexplained": "Could not attribute — investigate",
 }
@@ -64,6 +76,10 @@ HIGH_ACTIVITY_MIN_CACHE_HIT = 0.8
 # balance source moves in whole cents) AND traffic is cache-heavy. A larger
 # shortfall is real spend that's missing and stays "investigate".
 CENT_QUANTIZATION_MAX_GAP = 0.10
+# The peak premium is worth naming once it is at least this many dollars and
+# this share of the window's drop. Below both, it is rounding noise.
+PEAK_MIN_PREMIUM_USD = 0.01
+PEAK_MIN_PREMIUM_SHARE = 0.10
 
 
 def _explained_pct(reconciled_cost: float | None, window_spend: float) -> float | None:
@@ -72,8 +88,29 @@ def _explained_pct(reconciled_cost: float | None, window_spend: float) -> float 
     return reconciled_cost / window_spend * 100.0
 
 
-def summarize(spans: list[dict], *, window_spend: float) -> dict:
-    """Aggregate one window's span metrics into signals + per-model cost."""
+def summarize(
+    spans: list[dict],
+    *,
+    window_spend: float,
+    window_start_utc: str | None = None,
+    window_end_utc: str | None = None,
+) -> dict:
+    """Aggregate one window's span metrics into signals + per-model cost.
+
+    Cost is reported twice, deliberately:
+
+    - ``reconciled_cost_expected`` — the window's tokens priced at DeepSeek's
+      published rate for the band each request ran in (the number the balance
+      drop is reconciled against);
+    - ``reconciled_cost_litellm`` — Σ ``litellm.cost.total``, the tracer's flat
+      (peak-rate) figure, kept for reference and for the delta between them.
+
+    Per-request bands come from each span's start time when the trace carries
+    one; otherwise the whole window is assumed to sit in the band covering most
+    of it (``window_start_utc`` / ``window_end_utc``). When a span has no token
+    counts at all there is nothing to re-derive from, so the litellm figure is
+    used as-is and ``pricing.source`` says so.
+    """
     n = len(spans)
     cost = None
     input_tokens = uncached = cache_read = output_tokens = total_tokens = 0.0
@@ -83,6 +120,10 @@ def summarize(spans: list[dict], *, window_spend: float) -> dict:
     model_cost: Counter[str] = Counter()
     model_reqs: Counter[str] = Counter()
     top1_cost = 0.0
+    fallback_band = _fallback_band(window_start_utc, window_end_utc)
+    # band -> pricing model -> [cache_hit, cache_miss, output] tokens.
+    band_tokens: dict[str, dict[str, list[float]]] = {}
+    models_seen: set[str] = set()
 
     for span in spans:
         m = _span_metrics(span)
@@ -104,7 +145,62 @@ def summarize(spans: list[dict], *, window_spend: float) -> dict:
         if m["is_tool_call"]:
             tool_calls += 1
 
+        model_key = pricing.normalize_model(m["model"])
+        models_seen.add(model_key)
+        band = _span_band(m, fallback_band)
+        bucket = band_tokens.setdefault(band, {}).setdefault(model_key, [0.0, 0.0, 0.0])
+        bucket[0] += m["cache_read_tokens"]
+        bucket[1] += m["uncached_input_tokens"]
+        bucket[2] += m["output_tokens"]
+
     covered_cost = cost  # may be None if no span had a cost attribute
+
+    # What these tokens cost at the band they ran in, and at off-peak rates.
+    expected = 0.0
+    offpeak_equivalent = 0.0
+    peak_premium = 0.0
+    for band, models in band_tokens.items():
+        for model, (hit, miss, out) in models.items():
+            at_band = pricing.cost_of(
+                model, cache_hit_tokens=hit, cache_miss_tokens=miss,
+                output_tokens=out, band=band,
+            )
+            at_offpeak = pricing.cost_of(
+                model, cache_hit_tokens=hit, cache_miss_tokens=miss,
+                output_tokens=out, band=pricing.OFF_PEAK,
+            )
+            expected += at_band
+            offpeak_equivalent += at_offpeak
+            peak_premium += at_band - at_offpeak
+
+    has_tokens = (input_tokens + output_tokens) > 0
+    if has_tokens:
+        reconciled = expected
+        pricing_source = "tokens"
+    else:
+        # Nothing to re-derive from — trust the tracer rather than claim zero.
+        reconciled = covered_cost
+        expected = covered_cost
+        offpeak_equivalent = covered_cost
+        peak_premium = 0.0
+        pricing_source = "litellm"
+
+    overstatement = (
+        covered_cost - expected
+        if covered_cost is not None and expected is not None
+        else None
+    )
+    window_pricing = {
+        "band": _window_band(window_start_utc, window_end_utc),
+        "peak_overlap_minutes": _peak_overlap_minutes(window_start_utc, window_end_utc),
+        "peak_premium_usd": max(0.0, peak_premium) if expected is not None else None,
+        "expected_cost": expected,
+        "offpeak_equivalent_cost": offpeak_equivalent,
+        "litellm_cost": covered_cost,
+        "flat_peak_overstatement_usd": overstatement,
+        "source": pricing_source,
+        "models": sorted(models_seen),
+    }
 
     top_models = []
     for model, c in model_cost.most_common(4):
@@ -121,7 +217,10 @@ def summarize(spans: list[dict], *, window_spend: float) -> dict:
 
     return {
         "request_count": n,
-        "reconciled_cost": covered_cost,
+        "reconciled_cost": reconciled,
+        "reconciled_cost_expected": expected,
+        "reconciled_cost_litellm": covered_cost,
+        "pricing": window_pricing,
         "cost_attr_spans": cost_count,
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached,
@@ -134,9 +233,48 @@ def summarize(spans: list[dict], *, window_spend: float) -> dict:
         "dominant_span_cost": top1_cost,
         "dominant_span_share": (top1_cost / covered_cost) if covered_cost else None,
         "top_models": top_models,
-        "explained_cost_pct": _explained_pct(covered_cost, window_spend),
+        "explained_cost_pct": _explained_pct(reconciled, window_spend),
         "window_spend": window_spend,
     }
+
+
+def _fallback_band(window_start_utc: str | None, window_end_utc: str | None) -> str:
+    """Band assumed for spans with no timestamp of their own."""
+    if window_start_utc and window_end_utc:
+        try:
+            return pricing.fallback_band(window_start_utc, window_end_utc)
+        except ValueError:
+            pass
+    return pricing.OFF_PEAK
+
+
+def _window_band(window_start_utc: str | None, window_end_utc: str | None) -> str:
+    if window_start_utc and window_end_utc:
+        try:
+            return pricing.window_band(window_start_utc, window_end_utc)
+        except ValueError:
+            pass
+    return pricing.OFF_PEAK
+
+
+def _peak_overlap_minutes(window_start_utc: str | None, window_end_utc: str | None) -> float:
+    if window_start_utc and window_end_utc:
+        try:
+            return pricing.peak_overlap_minutes(window_start_utc, window_end_utc)
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _span_band(metrics: dict, fallback: str) -> str:
+    """The band a single span ran in: its own start time, else the window's."""
+    ts = metrics.get("start_time")
+    if ts:
+        try:
+            return pricing.pricing_band(ts)
+        except (ValueError, TypeError):
+            pass
+    return fallback
 
 
 def _is_cent_quantization_limited(signals: dict) -> bool:
@@ -148,6 +286,10 @@ def _is_cent_quantization_limited(signals: dict) -> bool:
     cost on cheap, cache-heavy traffic is a measurement floor — the classifier
     should not cry "investigate". A shortfall beyond the cent scale is real
     missing spend and stays ``investigate``.
+
+    A window that overlaps a peak band gets the same treatment: at a band
+    boundary the 2x premium and the grid-settlement lag routinely move a drop
+    by a cent or two, so a cent-scale shortfall there is noise, not lost spend.
     """
     cost = signals["reconciled_cost"]
     window_spend = signals["window_spend"]
@@ -156,7 +298,35 @@ def _is_cent_quantization_limited(signals: dict) -> bool:
     if window_spend - cost > CENT_QUANTIZATION_MAX_GAP:
         return False
     ratio = signals["cache_hit_ratio"]
-    return ratio is not None and ratio >= HIGH_ACTIVITY_MIN_CACHE_HIT
+    if ratio is not None and ratio >= HIGH_ACTIVITY_MIN_CACHE_HIT:
+        return True
+    # Not cache-heavy — but a peak-boundary window's residual is explained by
+    # the premium + settlement lag straddling the boundary.
+    pricing = signals.get("pricing") or {}
+    return (pricing.get("peak_overlap_minutes") or 0.0) > 0
+
+
+def _peak_premium_material(premium: float | None, window_spend: float | None) -> bool:
+    """True when the peak premium is worth naming (absolute and share floors)."""
+    premium = premium or 0.0
+    if premium < PEAK_MIN_PREMIUM_USD:
+        return False
+    return not (
+        window_spend and window_spend > 0 and premium < PEAK_MIN_PREMIUM_SHARE * window_spend
+    )
+
+
+def _peak_note(signals: dict) -> str | None:
+    """A one-clause note naming the peak premium, when there is one to name."""
+    pricing = signals.get("pricing") or {}
+    premium = pricing.get("peak_premium_usd") or 0.0
+    overlap = pricing.get("peak_overlap_minutes") or 0.0
+    if overlap <= 0 or not _peak_premium_material(premium, signals.get("window_spend")):
+        return None
+    return (
+        f"~${premium:.2f} of this is the 2x peak-hour premium "
+        f"({overlap:.0f} min of peak pricing, {pricing.get('band')} window)."
+    )
 
 
 def classify(signals: dict) -> dict:
@@ -229,6 +399,23 @@ def classify(signals: dict) -> dict:
         return _mk("large_output", actionable=True,
                    summary=f"Requests averaged {_tokens(avg_output)} output tokens each.")
 
+    # Peak pricing: the window sat in (or straddled) a published peak band and
+    # the 2x rate is a material part of what it cost. Only reached when no
+    # traffic-shape rule above fired — otherwise the shape is the primary
+    # reason and the peak premium is attached to the summary as a note.
+    pricing = signals.get("pricing") or {}
+    premium = pricing.get("peak_premium_usd") or 0.0
+    overlap = pricing.get("peak_overlap_minutes") or 0.0
+    if overlap > 0 and _peak_premium_material(premium, signals["window_spend"]):
+        return _mk(
+            "peak_pricing",
+            summary=(
+                f"{overlap:.0f} min of this window fell in DeepSeek's peak band, "
+                f"billing at 2x the off-peak rate — ~${premium:.2f} more than the "
+                "same tokens would cost off-peak."
+            ),
+        )
+
     # Benign: high activity but well-cached and normal-sized → not a candidate.
     if (n >= HIGH_ACTIVITY_MIN_REQUESTS
             and signals["cache_hit_ratio"] is not None
@@ -249,11 +436,33 @@ def _span_metrics(span: dict) -> dict:
     return _phx.span_metrics(span)
 
 
-def diagnose(spans: list[dict], *, window_spend: float, analyzed_at: str | None = None) -> dict:
-    """Full diagnosis for a window: signals + classified reason."""
-    signals = summarize(spans, window_spend=window_spend)
+def diagnose(
+    spans: list[dict],
+    *,
+    window_spend: float,
+    window_start_utc: str | None = None,
+    window_end_utc: str | None = None,
+    analyzed_at: str | None = None,
+) -> dict:
+    """Full diagnosis for a window: signals + classified reason.
+
+    The window bounds are optional but recommended: they let pricing fall back
+    to the right band for spans that carry no start time of their own.
+    """
+    signals = summarize(
+        spans,
+        window_spend=window_spend,
+        window_start_utc=window_start_utc,
+        window_end_utc=window_end_utc,
+    )
     decision = classify(signals)
+    # When peak pricing is not the headline reason it is still a fact about the
+    # window, so it rides along in the summary text.
+    note = _peak_note(signals)
+    if note and decision["reason"] != "peak_pricing":
+        decision["summary"] = f"{decision['summary']} {note}"
     decision["analyzed_at"] = analyzed_at or datetime.now(UTC).isoformat()
+    pricing = signals["pricing"]
     # Merge the top-level fields the DB stores + keep the signals for tuning.
     diag = {
         "reason": decision["reason"],
@@ -263,6 +472,11 @@ def diagnose(spans: list[dict], *, window_spend: float, analyzed_at: str | None 
         "summary": decision["summary"],
         "window_spend": signals["window_spend"],
         "reconciled_cost": signals["reconciled_cost"],
+        "reconciled_cost_expected": signals["reconciled_cost_expected"],
+        "reconciled_cost_litellm": signals["reconciled_cost_litellm"],
+        "pricing_band": pricing["band"],
+        "peak_overlap_minutes": pricing["peak_overlap_minutes"],
+        "peak_premium_usd": pricing["peak_premium_usd"],
         "explained_cost_pct": signals["explained_cost_pct"],
         "request_count": signals["request_count"],
         "cache_read_tokens": signals["cache_read_tokens"],
@@ -307,7 +521,12 @@ def diagnose_lookback(
     """
     if not prior_spans:
         return None
-    prior = summarize(prior_spans, window_spend=window_spend)
+    prior = summarize(
+        prior_spans,
+        window_spend=window_spend,
+        window_start_utc=prior_start_utc,
+        window_end_utc=prior_end_utc,
+    )
     cost = prior["reconciled_cost"]
     if not cost or cost <= 0:
         return None
@@ -331,12 +550,21 @@ def diagnose_lookback(
             f"signature: {prior_reason}."
         ),
     )
+    note = _peak_note(prior)
+    if note:
+        decision["summary"] = f"{decision['summary']} {note}"
     decision["analyzed_at"] = analyzed_at or datetime.now(UTC).isoformat()
+    pricing = prior["pricing"]
     diag = {
         **decision,
         "reason_label": REASONS["settled_from_prior_burst"],
         "window_spend": window_spend,
         "reconciled_cost": cost,
+        "reconciled_cost_expected": prior["reconciled_cost_expected"],
+        "reconciled_cost_litellm": prior["reconciled_cost_litellm"],
+        "pricing_band": pricing["band"],
+        "peak_overlap_minutes": pricing["peak_overlap_minutes"],
+        "peak_premium_usd": pricing["peak_premium_usd"],
         "explained_cost_pct": _explained_pct(cost, window_spend),
         "request_count": prior["request_count"],
         "cache_read_tokens": prior["cache_read_tokens"],

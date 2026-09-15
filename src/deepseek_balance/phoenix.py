@@ -58,6 +58,48 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _to_iso(value: Any) -> str | None:
+    """Normalise a span timestamp (ISO string or epoch number) to an ISO string."""
+    from datetime import UTC, datetime
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # Epoch seconds or milliseconds (Phoenix/LiteLLM report both).
+        seconds = float(value)
+        if seconds > 1e11:  # heuristically milliseconds
+            seconds /= 1000.0
+        return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
+
+
+def _span_start(span: dict) -> str | None:
+    """The span's start time as ISO, when the trace carries one.
+
+    Phoenix spans expose ``start_time``; LiteLLM/OTel variants use ``timestamp``
+    or a flattened attribute. This is what lets pricing attribute a request to
+    the band it actually ran in rather than the window it was bucketed into.
+    """
+    for key in ("start_time", "startTime", "timestamp"):
+        iso = _to_iso(span.get(key))
+        if iso:
+            return iso
+    for path in ("start_time", "timestamp", "startTime"):
+        iso = _to_iso(attr(span, path))
+        if iso:
+            return iso
+    return None
+
+
 def span_metrics(span: dict) -> dict:
     """Extract the metrics the heuristics care about from one LLM span.
 
@@ -101,6 +143,7 @@ def span_metrics(span: dict) -> dict:
 
     return {
         "cost": cost,
+        "start_time": _span_start(span),
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached_input,
         "cache_read_tokens": cache_read,

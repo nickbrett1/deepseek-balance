@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS interval_diagnostics (
   actionable INTEGER,
   investigate INTEGER,            -- 1 => could not explain, needs a human
   window_spend REAL,              -- interval spend (balance drop) we tried to explain
-  reconciled_cost REAL,           -- sum of litellm.cost.total over the window
+  reconciled_cost REAL,           -- token-derived cost at the window's pricing band (expected)
+  reconciled_cost_litellm REAL,   -- sum of litellm.cost.total (flat, peak-rate) over the window
+  pricing_band TEXT,              -- peak | off_peak | mixed (DeepSeek band for the window)
+  peak_overlap_minutes REAL,      -- minutes of the window that were peak-priced
+  peak_premium_usd REAL,          -- extra cost of the peak band over off-peak rates
   explained_cost_pct REAL,        -- reconciled_cost / window_spend * 100
   request_count INTEGER,
   cache_read_tokens INTEGER,
@@ -105,6 +109,10 @@ class BalanceDB:
         ("prior_burst_start_utc", "TEXT"),
         ("prior_burst_end_utc", "TEXT"),
         ("prior_burst_reason", "TEXT"),
+        ("reconciled_cost_litellm", "REAL"),
+        ("pricing_band", "TEXT"),
+        ("peak_overlap_minutes", "REAL"),
+        ("peak_premium_usd", "REAL"),
     )
 
     def _migrate(self) -> None:
@@ -297,6 +305,10 @@ class BalanceDB:
                     "investigate": bool(r.pop("investigate")),
                     "window_spend": r.pop("window_spend"),
                     "reconciled_cost": r.pop("reconciled_cost"),
+                    "reconciled_cost_litellm": r.pop("reconciled_cost_litellm", None),
+                    "pricing_band": r.pop("pricing_band", None),
+                    "peak_overlap_minutes": r.pop("peak_overlap_minutes", None),
+                    "peak_premium_usd": r.pop("peak_premium_usd", None),
                     "explained_cost_pct": r.pop("explained_cost_pct"),
                     "request_count": r.pop("request_count"),
                     "cache_read_tokens": r.pop("cache_read_tokens"),
@@ -376,6 +388,10 @@ class BalanceDB:
                         "investigate": bool(r["investigate"]),
                         "window_spend": r["window_spend"],
                         "reconciled_cost": r["reconciled_cost"],
+                        "reconciled_cost_litellm": r["reconciled_cost_litellm"],
+                        "pricing_band": r["pricing_band"],
+                        "peak_overlap_minutes": r["peak_overlap_minutes"],
+                        "peak_premium_usd": r["peak_premium_usd"],
                         "explained_cost_pct": r["explained_cost_pct"],
                         "request_count": r["request_count"],
                         "cache_read_tokens": r["cache_read_tokens"],
@@ -422,14 +438,16 @@ class BalanceDB:
                 """
                 INSERT INTO interval_diagnostics (
                   start_utc, reason, reason_label, actionable, investigate,
-                  window_spend, reconciled_cost, explained_cost_pct,
+                  window_spend, reconciled_cost, reconciled_cost_litellm,
+                  pricing_band, peak_overlap_minutes, peak_premium_usd,
+                  explained_cost_pct,
                   request_count, cache_read_tokens, uncached_input_tokens,
                   output_tokens, cache_hit_ratio, error_count, tool_call_count,
                   top_models, summary, payload, analyzed_at,
                   balance_start_ts, balance_start, balance_end_ts, balance_end,
                   prior_burst_start_utc, prior_burst_end_utc, prior_burst_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(start_utc) DO UPDATE SET
                   reason=excluded.reason,
                   reason_label=excluded.reason_label,
@@ -437,6 +455,10 @@ class BalanceDB:
                   investigate=excluded.investigate,
                   window_spend=excluded.window_spend,
                   reconciled_cost=excluded.reconciled_cost,
+                  reconciled_cost_litellm=excluded.reconciled_cost_litellm,
+                  pricing_band=excluded.pricing_band,
+                  peak_overlap_minutes=excluded.peak_overlap_minutes,
+                  peak_premium_usd=excluded.peak_premium_usd,
                   explained_cost_pct=excluded.explained_cost_pct,
                   request_count=excluded.request_count,
                   cache_read_tokens=excluded.cache_read_tokens,
@@ -465,6 +487,10 @@ class BalanceDB:
                     1 if diag.get("investigate") else 0,
                     diag.get("window_spend"),
                     diag.get("reconciled_cost"),
+                    diag.get("reconciled_cost_litellm"),
+                    diag.get("pricing_band"),
+                    diag.get("peak_overlap_minutes"),
+                    diag.get("peak_premium_usd"),
                     diag.get("explained_cost_pct"),
                     diag.get("request_count", 0),
                     diag.get("cache_read_tokens", 0),
