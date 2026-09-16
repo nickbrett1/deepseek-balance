@@ -212,8 +212,12 @@ def high_interval_diagnoses(
     Each entry also carries the DeepSeek pricing band the window fell in
     (`pricing_band`), `peak_overlap_minutes`, and `peak_premium_usd` — the
     extra the 2x peak rate added over off-peak rates for the same tokens.
-    `reconciled_cost` is token-derived at that band; `reconciled_cost_litellm`
-    is the tracer's flat (peak-rate) figure kept for reference.
+    `reconciled_cost` / `traced_cost` is token-derived at that band; it is the
+    numerator of `explained_cost_pct`, divided by `window_drop` — the balance
+    movement over the burst's *traced* (lag-padded) span, which is the same
+    span the traced cost covers. `reconciled_cost_litellm` is only the tracer's
+    flat (peak-rate) reference figure and is never the reconciled number: it is
+    consistently ~2x reality off-peak.
 
     Each entry is one **burst** (adjacent high slices reconciled together, so a
     spike straddling a slice boundary is not split into an over-attributed slice
@@ -271,6 +275,10 @@ def high_interval_diagnoses(
                     "pricing_band": diag.get("pricing_band"),
                     "peak_overlap_minutes": diag.get("peak_overlap_minutes"),
                     "peak_premium_usd": diag.get("peak_premium_usd"),
+                    # The ratio's actual inputs: numerator (traced_cost) and the
+                    # lag-padded window drop it divides into (window_drop).
+                    "window_drop": diag.get("window_drop"),
+                    "traced_cost": diag.get("traced_cost"),
                     "explained_cost_pct": diag["explained_cost_pct"],
                     "request_count": diag["request_count"],
                     "cache_read_tokens": diag["cache_read_tokens"],

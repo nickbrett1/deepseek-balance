@@ -34,6 +34,11 @@ from . import phoenix
 DEFAULT_GAP_SLICES = 1
 # The meter's observed settling lag is ~1 slice (see the memo's 2026-09-15 case).
 DEFAULT_LAG_SLICES = 1
+# Two *assembled bursts* separated by at most this many quiet slices are one
+# event: a spike whose flush is spread across snapshots can otherwise fragment
+# into two bursts whose individual (member-slice) deltas each understate the
+# movement, which is what produced the spurious `over_attributed` rows.
+DEFAULT_MERGE_GAP_SLICES = 1
 
 
 def _start(slice_row: dict) -> str | None:
@@ -52,6 +57,7 @@ def assemble_bursts(
     spike_threshold: float | None = None,
     below_floor: float | None = None,
     lag_slices: int = DEFAULT_LAG_SLICES,
+    merge_gap_slices: int = DEFAULT_MERGE_GAP_SLICES,
 ) -> list[dict]:
     """Coalesce flagged slices into bursts.
 
@@ -59,6 +65,11 @@ def assemble_bursts(
     bucket}``); only ``bucket == "high"`` slices seed a burst, but a spent,
     non-high slice is used to bridge a run (up to ``gap_slices`` of them) and to
     expand a burst's edges when its spend is above ``below_floor``.
+
+    After the per-run assembly, adjacent bursts no more than
+    ``merge_gap_slices`` quiet slices apart are coalesced (see
+    :func:`merge_bursts`): one spike whose flush is split across snapshots must
+    be scored as one event, not two under-sized ones.
 
     Returns the bursts oldest-first, each ``{burst_id, start_utc, end_utc,
     spend, member_slices, member_slice_count, lag_slices}``. ``burst_id`` is the
@@ -135,7 +146,51 @@ def assemble_bursts(
                 "lag_slices": lag_slices,
             }
         )
-    return bursts
+    return merge_bursts(
+        bursts,
+        slice_minutes=slice_minutes,
+        merge_gap_slices=merge_gap_slices,
+    )
+
+
+def merge_bursts(
+    bursts: list[dict],
+    *,
+    slice_minutes: int = 5,
+    merge_gap_slices: int = DEFAULT_MERGE_GAP_SLICES,
+) -> list[dict]:
+    """Coalesce bursts separated by no more than ``merge_gap_slices`` slices.
+
+    A burst's ``end_utc`` is the end of its last member slice, so the gap to
+    the next burst is ``next.start_utc − prev.end_utc``. When that gap is at
+    most ``merge_gap_slices`` quiet slices the two runs are one event spread
+    over the meter's snapshot grid, so they are merged into a single burst
+    (oldest start, newest end, summed spend, concatenated members). The merged
+    ``burst_id`` stays the first burst's start, keeping a re-run idempotent.
+
+    Input order is normalised (oldest-first); the returned dicts are copies, so
+    callers can keep the input for inspection.
+    """
+    if merge_gap_slices <= 0 or len(bursts) <= 1:
+        return [dict(b, member_slices=list(b.get("member_slices", []))) for b in bursts]
+
+    gap_seconds = merge_gap_slices * slice_minutes * 60
+    ordered = sorted(bursts, key=lambda b: _parse(b["start_utc"]))
+    merged: list[dict] = []
+    for burst in ordered:
+        if merged:
+            prev = merged[-1]
+            gap = (_parse(burst["start_utc"]) - _parse(prev["end_utc"])).total_seconds()
+            if gap <= gap_seconds:
+                prev["end_utc"] = burst["end_utc"]
+                prev["spend"] = (prev["spend"] or 0.0) + (burst["spend"] or 0.0)
+                prev["member_slices"] = prev["member_slices"] + list(
+                    burst.get("member_slices", [])
+                )
+                prev["member_slice_count"] = len(prev["member_slices"])
+                continue
+        merged.append(dict(burst, member_slices=list(burst.get("member_slices", []))))
+    return merged
 
 
 def _window(burst: dict, lag_seconds: float) -> tuple[datetime, datetime, datetime, datetime]:
@@ -213,6 +268,7 @@ def reconcile_day(
     spike_threshold: float | None = None,
     below_floor: float | None = None,
     lag_slices: int = DEFAULT_LAG_SLICES,
+    merge_gap_slices: int = DEFAULT_MERGE_GAP_SLICES,
 ) -> tuple[list[dict], dict[int, list[dict]], list[dict]]:
     """Assemble a day's bursts and attribute every span to exactly one of them.
 
@@ -226,6 +282,7 @@ def reconcile_day(
         spike_threshold=spike_threshold,
         below_floor=below_floor,
         lag_slices=lag_slices,
+        merge_gap_slices=merge_gap_slices,
     )
     owned, unassigned = assign_spans(
         spans, day_bursts, lag_slices=lag_slices, slice_minutes=slice_minutes

@@ -224,6 +224,82 @@ def test_memo_regression_two_slices_collapse_to_one_burst():
     assert diag["burst_id"] == burst["burst_id"]
 
 
+def test_merge_bursts_coalesces_fragments():
+    """Two bursts a single quiet slice apart are one event; a wider gap is not."""
+    def burst(start, end, spend, n=1):
+        return {
+            "burst_id": start, "start_utc": start, "end_utc": end, "spend": spend,
+            "member_slices": [{"start_utc": start, "spend": spend}] * n,
+            "member_slice_count": n, "lag_slices": 1,
+        }
+
+    a = burst("2026-09-15T08:15:00+00:00", "2026-09-15T08:20:00+00:00", 0.2)
+    b = burst("2026-09-15T08:25:00+00:00", "2026-09-15T08:30:00+00:00", 0.3)
+    merged = bursts.merge_bursts([a, b], slice_minutes=5, merge_gap_slices=1)
+    assert len(merged) == 1
+    assert merged[0]["start_utc"] == a["start_utc"]
+    assert merged[0]["end_utc"] == b["end_utc"]
+    assert merged[0]["spend"] == pytest.approx(0.5)
+    assert merged[0]["member_slice_count"] == 2
+    # The first burst's id survives, so a re-run stays idempotent.
+    assert merged[0]["burst_id"] == a["burst_id"]
+
+    far = burst("2026-09-15T08:45:00+00:00", "2026-09-15T08:50:00+00:00", 0.3)
+    assert len(bursts.merge_bursts([a, far], slice_minutes=5, merge_gap_slices=1)) == 2
+
+
+def test_assemble_merges_fragments_into_one_burst():
+    """A high run whose settle-tail meets the next high run is one event: the
+    two groups would each understate their delta, so they are merged."""
+    slices = [
+        _slice("2026-09-15T08:15:00+00:00", 0.40),
+        _slice("2026-09-15T08:20:00+00:00", 0.03, bucket="normal"),
+        _slice("2026-09-15T08:25:00+00:00", 0.03, bucket="normal"),
+        _slice("2026-09-15T08:30:00+00:00", 0.40),
+    ]
+    merged = bursts.assemble_bursts(
+        slices, slice_minutes=5, spike_threshold=0.1, below_floor=0.02,
+        merge_gap_slices=1,
+    )
+    assert len(merged) == 1
+    assert merged[0]["member_slice_count"] == 4
+    assert merged[0]["spend"] == pytest.approx(0.86)
+    # Disabling the merge leaves the two fragments separate.
+    split = bursts.assemble_bursts(
+        slices, slice_minutes=5, spike_threshold=0.1, below_floor=0.02,
+        merge_gap_slices=0,
+    )
+    assert len(split) == 2
+
+
+def test_zero_or_negative_window_drop_is_unexplained_not_divided():
+    """A window with no measurable drop must not divide into a huge percentage."""
+    spans = [_span(cost=0.1, input=1000) for _ in range(3)]
+    zero = heuristics.diagnose(spans, window_spend=0.0)
+    assert zero["reason"] == "unexplained"
+    assert zero["investigate"] is True
+    assert zero["explained_cost_pct"] is None
+    negative = heuristics.diagnose(spans, window_spend=-0.05)
+    assert negative["reason"] == "unexplained"
+
+
+def test_over_attribution_denominator_artifact_is_not_flagged():
+    """An over-100% ratio whose tracer matches the token cost is a mis-sized
+    denominator, not double counting — it must not be actionable."""
+    start, end = "2026-09-15T01:05:00+00:00", "2026-09-15T01:10:00+00:00"  # peak band
+    tokens = {"input": 5000, "cached": 4800, "output": 100}
+    per = _reconciled([_span(start=start, **tokens)])
+    spans = [_span(start=start, cost=per, **tokens) for _ in range(30)]
+    expected = _reconciled(spans, start=start, end=end)
+    diag = heuristics.diagnose(
+        spans, window_spend=expected / 3.0,
+        window_start_utc=start, window_end_utc=end,
+    )
+    assert diag["explained_cost_pct"] > 200
+    assert diag["reason"] != "over_attributed"
+    assert diag["investigate"] is False
+
+
 def test_over_attribution_is_caught_not_clamped():
     """Acceptance 3: span cost 2.5x the delta reports `over_attributed`."""
     spans = [_span(cost=0.1, input=2000, output=100) for _ in range(4)]
@@ -304,6 +380,77 @@ def test_analysis_plain_slice_diagnosed_without_lag(tmp_path):
     assert phoenix.calls[0] == ("2026-09-15T08:15:00+00:00", "2026-09-15T08:20:00+00:00")
 
 
+def _seed_snapshots(db, slot_balances: dict[str, float]) -> None:
+    """Seed one grid snapshot per ``{slot: balance}`` (scheduled at the slot)."""
+    for slot, bal in slot_balances.items():
+        db.insert_snapshot(
+            ts=slot.replace(":00+00:00", ":05+00:00"), scheduled_ts=slot,
+            currency="USD", total_balance=bal, granted_balance=0.0,
+            topped_up_balance=bal, is_available=True, http_status=200, raw="{}",
+        )
+
+
+def test_reconciliation_credits_the_drop_over_the_traced_window(tmp_path):
+    """The memo case: the flush is spread across later snapshots, so the
+    denominator must be the drop over the whole traced window, not the one
+    member slice. With only the member delta the burst reads 215%
+    (`over_attributed`); with the window drop it reconciles ~100%."""
+    db = BalanceDB(str(tmp_path / "drop.db"))
+    start, end = "2026-09-16T16:25:00+00:00", "2026-09-16T16:30:00+00:00"
+    spans = [
+        _span(start="2026-09-16T16:26:00+00:00", cost=0.2, input=5000, cached=4800)
+        for _ in range(30)
+    ]
+    reconciled = _reconciled(spans, start=start, end=end)
+    member_spend = reconciled / 2.15  # what the old member-slice denominator saw
+    _seed_snapshots(db, {
+        start: 11.34,                              # opens the burst
+        end: 11.27,                                # only part of the flush landed here
+        "2026-09-16T16:35:00+00:00": 11.34 - reconciled,  # settles by end + lag
+    })
+    phoenix = _RecordingPhoenix(spans=spans)
+    svc = AnalysisService(db, phoenix, lookback_days=1, attribution_lag_slices=1)
+    high = {
+        "start_utc": start, "end_utc": end, "slice_minutes": 5,
+        "spend": member_spend, "burst_id": start, "member_slice_count": 1,
+        "lag_slices": 1,
+    }
+    diag = svc._diagnose(high)
+    assert diag is not None
+    assert diag["reason"] != "over_attributed"
+    assert diag["reason"] == "high_activity_cached"
+    assert diag["investigate"] is False
+    # The denominator is the window drop; the member delta is kept separately.
+    assert diag["window_drop"] == pytest.approx(reconciled, abs=1e-9)
+    assert diag["burst_spend"] == pytest.approx(member_spend, abs=1e-9)
+    assert diag["traced_cost"] == pytest.approx(reconciled, abs=1e-9)
+    assert diag["explained_cost_pct"] == pytest.approx(100.0, abs=1.0)
+    # No member slice would have reconciled on its own.
+    assert member_spend / reconciled == pytest.approx(1 / 2.15)
+    # The recorded pair is the reconciliation span, not the member slice.
+    assert diag["balance_start_ts"].startswith("2026-09-16T16:25")
+    assert diag["balance_end_ts"].startswith("2026-09-16T16:35")
+
+
+def test_reconciliation_falls_back_to_member_spend_without_snapshots(tmp_path):
+    """With no reconciliation snapshot the member-slice delta is used, so the
+    row still reconciles (never divides by a missing/zero window)."""
+    db = BalanceDB(str(tmp_path / "nosnap.db"))
+    start, end = "2026-09-16T16:25:00+00:00", "2026-09-16T16:30:00+00:00"
+    spans = [_span(start="2026-09-16T16:26:00+00:00", cost=0.2, input=5000, cached=4800)
+             for _ in range(30)]
+    spend = _reconciled(spans, start=start, end=end)
+    svc = AnalysisService(db, _RecordingPhoenix(spans=spans), lookback_days=1,
+                          attribution_lag_slices=1)
+    high = {
+        "start_utc": start, "end_utc": end, "slice_minutes": 5,
+        "spend": spend, "burst_id": start, "member_slice_count": 1, "lag_slices": 1,
+    }
+    diag = svc._diagnose(high)
+    assert diag["window_drop"] == pytest.approx(spend)
+    assert diag["explained_cost_pct"] == pytest.approx(100.0, abs=1.0)
+
+
 # --- Stage 5: burst fields round-trip ---------------------------------------
 
 def test_burst_fields_round_trip_through_the_db(tmp_path):
@@ -332,6 +479,9 @@ def test_burst_fields_round_trip_through_the_db(tmp_path):
     assert got["top_conversation_id"] == "conv-1"
     assert got["prefix_tokens"] == pytest.approx(39_000)
     assert got["peak_prompt_tokens"] == pytest.approx(170_000)
+    # The ratio's inputs round-trip too, so it is reproducible from the row.
+    assert got["window_drop"] == pytest.approx(got["window_spend"])
+    assert got["traced_cost"] == pytest.approx(got["reconciled_cost"])
 
     detailed = db.high_intervals_detailed(limit=10)[0]["diagnosis"]
     assert detailed["signature"] == "cache_prefix_unstable"

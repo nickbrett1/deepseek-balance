@@ -21,10 +21,18 @@ answer is "unexplained — investigate", not a made-up cause.
 The reconciliation compares the drop against **``reconciled_cost_expected``** —
 what the window's token counts cost at the DeepSeek rate for the band each
 request actually ran in (see ``pricing.py``) — not against LiteLLM's flat
-``litellm.cost.total``, which *always* charges the peak rate. The litellm
-figure is kept as ``reconciled_cost_litellm`` for reference, and the gap between
-them is surfaced as ``flat_peak_overstatement_usd``: in off-peak windows the
-tracer is ~2x high, which is what skewed earlier reconciliation.
+``litellm.cost.total``, which *always* charges the peak rate. That LiteLLM sum
+is kept as ``reconciled_cost_litellm`` purely as a **flat-peak reference** (it
+is consistently ~2x the truth off-peak); it is never the "traced" figure the
+drop is reconciled against, and must not be presented as one. The gap between
+the two is surfaced as ``flat_peak_overstatement_usd``.
+
+The denominator — ``window_spend`` — is the balance movement over the *traced*
+window, not one member slice: the caller (``analysis``) credits the drop from
+the snapshot opening the burst to the snapshot closing it **plus the settling
+lag**, so a burst whose flush is spread over several snapshots is not reported
+as over-attributed. A window with no measurable (zero/negative) drop cannot be
+divided into and falls back to ``unexplained``.
 """
 
 from __future__ import annotations
@@ -81,6 +89,14 @@ MIN_EXPLAINED_RATIO = 0.5
 # is evidence, not a benign clamp.
 UNDER_FACTOR = 0.5
 OVER_FACTOR = 2.0
+# `over_attributed` must not fire on a mere denominator mismatch. With the drop
+# now credited over the full traced window, a genuine double count is the only
+# thing that should push the traced cost past the drop, and it leaves a second
+# fingerprint: the raw tracer sum (Σ litellm.cost.total) sits far above what the
+# window's tokens can cost at *any* band — beyond the flat-peak factor that
+# already overstates off-peak by ~2x. Below this multiple, an over-100% ratio is
+# treated as measurement noise rather than actionable double counting.
+DOUBLE_COUNT_TRACER_FACTOR = 2.5
 # `cache_prefix_unstable`: a single conversation whose context grows turn over
 # turn while the prompt cache keeps serving only the (small) system prefix. Needs
 # a few turns to be meaningful, a non-trivial prefix, context that actually grows,
@@ -437,11 +453,35 @@ def _peak_note(signals: dict) -> str | None:
     )
 
 
+def _double_count_suspected(signals: dict) -> bool:
+    """True when the raw tracer sum betrays duplicated spans.
+
+    The tracer (Σ ``litellm.cost.total``) is a flat *peak* price, so off-peak it
+    already sits ~2x above the band-correct token-derived cost — that gap is
+    expected, not evidence. A genuine double count pushes it past even that
+    factor (roughly 2x *again*), or leaves tracer cost with no token basis at
+    all. Only then should an over-100% ratio be read as double counting rather
+    than a mis-sized denominator.
+    """
+    litellm = signals.get("reconciled_cost_litellm")
+    if not litellm or litellm <= 0:
+        return False
+    expected = signals.get("reconciled_cost_expected")
+    if not expected or expected <= 0:
+        # Tracer cost with no tokens behind it: nothing to price it against.
+        return True
+    band = (signals.get("pricing") or {}).get("band")
+    # Off-peak / mixed windows carry the flat-peak overstatement already.
+    factor = DOUBLE_COUNT_TRACER_FACTOR if band in ("off_peak", "mixed") else 1.5
+    return litellm > factor * expected
+
+
 def classify(signals: dict) -> dict:
     """Pick the primary reason for a window from its aggregated signals."""
     n = signals["request_count"]
     cost = signals["reconciled_cost"]
     explained = signals["explained_cost_pct"]
+    window_spend = signals.get("window_spend") or 0.0
 
     # No observable LLM traffic at all.
     if n == 0:
@@ -454,15 +494,28 @@ def classify(signals: dict) -> dict:
         return _mk("unexplained", investigate=True,
                    summary="Spans carry no cost attributes, so the spend can't be tied to LLM calls.")
 
+    # No measurable drop to reconcile against: a zero or negative (top-up)
+    # movement must not divide into a meaningless percentage — say so plainly.
+    if window_spend <= 0:
+        return _mk("unexplained", investigate=True,
+                   summary=(f"No measurable balance drop for this window "
+                            f"({_money(window_spend)}); {_money(cost)} of traced LLM cost "
+                            "cannot be reconciled against a zero or negative movement."))
+
     # Attribution health, in band order: over-attributed cost is evidence of a
-    # double count or a lag longer than the burst window, so it is surfaced —
-    # not silently clamped into a benign bucket the way it used to be.
-    if explained is not None and explained > OVER_FACTOR * 100:
+    # double count, so it is surfaced — but only when the tracer itself betrays
+    # duplicated spans. An over-100% ratio with a sane tracer is a denominator
+    # artifact, not actionable, and falls through to the traffic-shape rules.
+    if (
+        explained is not None
+        and explained > OVER_FACTOR * 100
+        and _double_count_suspected(signals)
+    ):
         return _mk("over_attributed", investigate=True,
                    summary=(f"Traced LLM cost ({_money(cost)}) is ~{explained:.0f}% of the "
-                            f"{_money(signals['window_spend'])} drop — more than the drop "
-                            "itself; cost is double counted or the meter lags beyond this "
-                            "burst window."))
+                            f"{_money(window_spend)} drop — more than the drop itself, and "
+                            "the raw tracer sum is far above what these tokens cost at any "
+                            "rate; cost looks double counted."))
 
     if explained is not None and explained < UNDER_FACTOR * 100:
         if _is_cent_quantization_limited(signals):
@@ -577,11 +630,18 @@ def diagnose(
     burst_end_utc: str | None = None,
     member_slice_count: int = 1,
     lag_slices: int = 0,
+    burst_spend: float | None = None,
 ) -> dict:
     """Full diagnosis for a window: signals + classified reason.
 
     The window bounds are optional but recommended: they let pricing fall back
     to the right band for spans that carry no start time of their own.
+
+    ``window_spend`` is the reconciliation **denominator** — the balance drop
+    over the traced window (lag-padded), which is what ``explained_cost_pct``
+    divides into. ``burst_spend`` is the separate, auditable sum of the burst's
+    *member-slice* deltas (defaults to ``window_spend`` for a bare window); both
+    are stored so the ratio can be re-derived from the row alone.
 
     ``burst_*`` / ``member_slice_count`` / ``lag_slices`` describe the burst the
     window belongs to (a bare slice is a one-member burst): the burst bounds,
@@ -612,7 +672,12 @@ def diagnose(
         "actionable": decision.get("actionable", False),
         "investigate": decision.get("investigate", False),
         "summary": decision["summary"],
+        # `window_spend` is the drop over the traced window (the denominator);
+        # `window_drop` mirrors it explicitly and `traced_cost` is the numerator
+        # actually used, so the ratio is reproducible from the row alone.
         "window_spend": signals["window_spend"],
+        "window_drop": signals["window_spend"],
+        "traced_cost": signals["reconciled_cost"],
         "reconciled_cost": signals["reconciled_cost"],
         "reconciled_cost_expected": signals["reconciled_cost_expected"],
         "reconciled_cost_litellm": signals["reconciled_cost_litellm"],
@@ -634,7 +699,7 @@ def diagnose(
         "burst_id": burst_id or burst_start_utc or window_start_utc,
         "burst_start_utc": burst_start_utc or window_start_utc,
         "burst_end_utc": burst_end_utc or window_end_utc,
-        "burst_spend": signals["window_spend"],
+        "burst_spend": burst_spend if burst_spend is not None else signals["window_spend"],
         "member_slice_count": member_slice_count,
         "reconciled_cost_lag_slices": lag_slices,
         # Conversation context (drives / explains `cache_prefix_unstable`).
@@ -714,6 +779,8 @@ def diagnose_lookback(
         **decision,
         "reason_label": REASONS["settled_from_prior_burst"],
         "window_spend": window_spend,
+        "window_drop": window_spend,
+        "traced_cost": cost,
         "reconciled_cost": cost,
         "reconciled_cost_expected": prior["reconciled_cost_expected"],
         "reconciled_cost_litellm": prior["reconciled_cost_litellm"],

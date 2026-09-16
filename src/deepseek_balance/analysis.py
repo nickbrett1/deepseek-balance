@@ -43,6 +43,8 @@ DEFAULT_MAX_HIGH_TO_RECORD = 200   # cap on intervals recorded per pass
 # the meter's observed settling lag is allowed for when attributing spans.
 DEFAULT_BURST_GAP_SLICES = 1
 DEFAULT_ATTRIBUTION_LAG_SLICES = 1
+# Fragments of one event (a flush split over snapshots) closer than this join.
+DEFAULT_BURST_MERGE_GAP_SLICES = bursts.DEFAULT_MERGE_GAP_SLICES
 
 
 def _int_env(name: str, default: int) -> int:
@@ -103,6 +105,7 @@ class AnalysisService:
         max_diagnose_per_run: int = DEFAULT_MAX_DIAGNOSE_PER_RUN,
         burst_gap_slices: int | None = None,
         attribution_lag_slices: int | None = None,
+        burst_merge_gap_slices: int | None = None,
     ) -> None:
         self.db = db
         self.phoenix = phoenix
@@ -118,6 +121,11 @@ class AnalysisService:
             attribution_lag_slices
             if attribution_lag_slices is not None
             else _int_env("ATTRIBUTION_LAG_SLICES", DEFAULT_ATTRIBUTION_LAG_SLICES)
+        )
+        self.burst_merge_gap_slices = (
+            burst_merge_gap_slices
+            if burst_merge_gap_slices is not None
+            else _int_env("BURST_MERGE_GAP_SLICES", DEFAULT_BURST_MERGE_GAP_SLICES)
         )
 
     # --- detection ---------------------------------------------------------
@@ -152,6 +160,7 @@ class AnalysisService:
             spike_threshold=threshold,
             below_floor=below_floor,
             lag_slices=self.attribution_lag_slices,
+            merge_gap_slices=self.burst_merge_gap_slices,
         )
         for b in detected:
             b["slice_minutes"] = slice_minutes
@@ -224,20 +233,55 @@ class AnalysisService:
         prior_start = start - timedelta(minutes=slice_minutes)
         return prior_start.isoformat(), start.isoformat()
 
-    def _attach_balance_pair(self, diag: dict, high: dict) -> None:
-        """Record the snapshot pair whose drop this window explains (T2).
+    def _reconciliation_pair(
+        self, high: dict, lag_seconds: float
+    ) -> tuple[float, dict, dict] | None:
+        """The snapshot pair whose movement this burst's traced cost explains.
 
-        ``window_spend`` is the balance decline between the two grid-slot
-        snapshots bracketing the slice, so the pair (``balance_start`` −
-        ``balance_end``) accounts for it exactly and the settlement lag becomes
-        visible in the row rather than inferable from a separate history call.
+        The traced cost covers the lag-padded window, so the balance movement
+        it is reconciled against must too: from the snapshot opening the burst
+        to the snapshot closing it **plus the settling lag**
+        (``[burst_start, burst_end + lag]``). Using only the member slices'
+        own delta — the old denominator — understated the movement whenever a
+        flush was spread over several snapshots and reported a spurious
+        ``over_attributed`` (see the reconciliation memo).
+
+        Returns ``(drop, start_row, end_row)`` or ``None`` when either grid slot
+        has no snapshot (the caller then falls back to the member-slice delta).
         """
         start = self.db.snapshot_at(high["start_utc"])
-        end = self.db.snapshot_at(high["end_utc"])
-        diag["balance_start_ts"] = start["ts"] if start else None
-        diag["balance_start"] = start["total_balance"] if start else None
-        diag["balance_end_ts"] = end["ts"] if end else None
-        diag["balance_end"] = end["total_balance"] if end else None
+        end_slot = _shift(high["end_utc"], lag_seconds)
+        end = self.db.snapshot_at(end_slot)
+        if not start or not end:
+            return None
+        if start["total_balance"] is None or end["total_balance"] is None:
+            return None
+        return start["total_balance"] - end["total_balance"], start, end
+
+    def _attach_balance_pair(self, diag: dict, high: dict, lag_seconds: float) -> None:
+        """Record the snapshot pair whose drop this window explains (T2).
+
+        The pair is the *reconciliation* span — the burst's opening snapshot and
+        the snapshot one settling-lag after its close — so its delta is exactly
+        the ``window_drop`` the ratio divides into and the settlement lag is
+        visible in the row rather than inferable from a separate history call.
+        """
+        pair = self._reconciliation_pair(high, lag_seconds)
+        if pair is not None:
+            _, start, end = pair
+            diag["balance_start_ts"] = start["ts"]
+            diag["balance_start"] = start["total_balance"]
+            diag["balance_end_ts"] = end["ts"]
+            diag["balance_end"] = end["total_balance"]
+        else:
+            # No reconciliation pair: fall back to the member-slice bracketing
+            # snapshots so the row still carries a pair where one exists.
+            start = self.db.snapshot_at(high["start_utc"])
+            end = self.db.snapshot_at(high["end_utc"])
+            diag["balance_start_ts"] = start["ts"] if start else None
+            diag["balance_start"] = start["total_balance"] if start else None
+            diag["balance_end_ts"] = end["ts"] if end else None
+            diag["balance_end"] = end["total_balance"] if end else None
         # Keep the referenced-burst keys present on every row, so a plain
         # "unexplained" window and a lookback-attributed one have the same shape.
         diag.setdefault("prior_burst_start_utc", None)
@@ -301,7 +345,12 @@ class AnalysisService:
             logger.warning("Phoenix fetch failed for %s: %s", high["start_utc"], exc)
             return None
         spans = self._owned_spans(spans, high, lag_slices)
-        window_spend = high["spend"] or 0.0
+        member_spend = high["spend"] or 0.0
+        # Denominator = the drop over the traced (lag-padded) window, not the
+        # member slices' own delta. Only fall back to the member delta when the
+        # grid has no snapshot at one end of the reconciliation span.
+        pair = self._reconciliation_pair(high, lag_seconds)
+        window_spend = pair[0] if pair is not None else member_spend
         diag = heuristics.diagnose(
             spans,
             window_spend=window_spend,
@@ -312,6 +361,7 @@ class AnalysisService:
             burst_end_utc=high["end_utc"],
             member_slice_count=high.get("member_slice_count") or 1,
             lag_slices=lag_slices,
+            burst_spend=member_spend,
         )
 
         # One-interval lookback: an empty window may be a lagged settlement of
@@ -341,7 +391,12 @@ class AnalysisService:
                 if look is not None:
                     diag = look
 
-        self._attach_balance_pair(diag, high)
+        # Keep the reconciliation fields coherent however the reason was reached
+        # (including the lookback path, which builds its own diagnosis dict).
+        diag["window_drop"] = window_spend
+        diag["traced_cost"] = diag.get("reconciled_cost")
+        diag["burst_spend"] = member_spend
+        self._attach_balance_pair(diag, high, lag_seconds)
         return diag
 
     def redo(self, *, now: datetime | None = None) -> dict:
