@@ -49,9 +49,12 @@ steps:
           exit 1
         fi
         echo "$$GHCR_TOKEN" | docker login ghcr.io -u "$$GHCR_USERNAME" --password-stdin
-      - docker buildx create --use --bootstrap || true
+      - |
+        BUILDX_BUILDER_NAME="bk-$$BUILDKITE_PIPELINE_SLUG-$$BUILDKITE_JOB_ID"
+        trap 'docker buildx rm "$$BUILDX_BUILDER_NAME" >/dev/null 2>&1 || true' EXIT
+        docker buildx create --bootstrap --name "$$BUILDX_BUILDER_NAME" >/dev/null
       - >
-        docker buildx build --platform linux/amd64
+        docker buildx build --builder "$$BUILDX_BUILDER_NAME" --platform linux/amd64
         --cache-from type=registry,ref=$$CACHE_REF
         --cache-to type=registry,ref=$$CACHE_REF,mode=max
         -t $$IMAGE:$$BUILDKITE_COMMIT -t $$IMAGE:latest --push .
