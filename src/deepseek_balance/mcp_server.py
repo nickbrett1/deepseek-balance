@@ -315,6 +315,12 @@ def high_interval_diagnoses(
             )
             if include_signals and diag.get("signals") is not None:
                 entry["signals"] = diag["signals"]
+        else:
+            # No diagnosis yet — surface the dive health so an agent can tell a
+            # window still awaiting its first pass from one Phoenix keeps
+            # failing (and has stopped being retried).
+            entry["analysis_attempts"] = r.get("analysis_attempts") or 0
+            entry["analysis_error"] = r.get("analysis_error")
         entries.append(entry)
 
     return {

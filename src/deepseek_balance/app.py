@@ -115,6 +115,9 @@ def _analysis_service(db: BalanceDB) -> analysis_mod.AnalysisService | None:
         max_diagnose_per_run=_int_env(
             "MAX_DIAGNOSE_PER_RUN", analysis_mod.DEFAULT_MAX_DIAGNOSE_PER_RUN
         ),
+        max_attempts=_int_env(
+            "ANALYSIS_MAX_ATTEMPTS", analysis_mod.DEFAULT_MAX_ANALYSIS_ATTEMPTS
+        ),
     )
 
 
@@ -318,6 +321,10 @@ def _analysis_rows(
                 "slice_minutes": r["slice_minutes"],
                 "spend": r["spend"],
                 "diagnosis": r["diagnosis"],
+                # Phoenix-dive health for a not-yet-diagnosed row: lets the UI
+                # say "Phoenix failed" instead of "Awaiting the next pass".
+                "analysis_attempts": r.get("analysis_attempts") or 0,
+                "analysis_error": r.get("analysis_error"),
             }
         )
     next_before = out[-1]["start_utc"] if (has_more and out) else None
@@ -358,6 +365,7 @@ def analysis_high_intervals(
         "configured": True,
         "timezone": datetime.now().astimezone().tzname(),
         "status": status,
+        "max_attempts": getattr(service, "max_attempts", None),
         "rows": rows,
         "has_more": has_more,
         "next_before": next_before,
@@ -639,6 +647,7 @@ HISTORY_HTML = """<!DOCTYPE html>
   .chip.inv { background:rgba(248,113,113,.18); color:#fca5a5; }
   .chip.ok { background:rgba(52,211,153,.15); color:#6ee7b7; }
   .chip.pend { background:rgba(148,163,184,.15); color:#94a3b8; }
+  .chip.fail { background:rgba(248,113,113,.18); color:#fca5a5; }
   table#ahi td.summary { max-width:420px; }
   table#ahi td.summary b { color:#e2e8f0; }
   table#ahi td.summary div { opacity:.75; }
@@ -986,11 +995,16 @@ const anote = document.getElementById("anote");
 let ahiBefore = null;          // UTC cursor for paging to older intervals
 let ahiStatus = "all";         // active diagnosis-status filter ("all" = every status)
 
-function chipFor(diag) {
-  if (!diag) return '<span class="chip pend">analysing</span>';
-  if (diag.investigate) return '<span class="chip inv">investigate</span>';
-  if (diag.actionable) return '<span class="chip act">actionable</span>';
-  return '<span class="chip ok">fine</span>';
+function chipFor(diag, failed) {
+  if (diag) {
+    if (diag.investigate) return '<span class="chip inv">investigate</span>';
+    if (diag.actionable) return '<span class="chip act">actionable</span>';
+    return '<span class="chip ok">fine</span>';
+  }
+  // No diagnosis: distinguish a genuine Phoenix failure from "not yet run",
+  // so a window that will never be analysed is not shown as merely pending.
+  if (failed) return '<span class="chip fail">failed</span>';
+  return '<span class="chip pend">analysing</span>';
 }
 
 function whenCell(iso) {
@@ -1026,15 +1040,29 @@ function renderAnalysis(d) {
   }
   tbody.innerHTML = d.rows.map(r => {
     const diag = r.diagnosis;
-    const label = diag ? '<b>' + (diag.reason_label || diag.reason) + "</b>" : "analysis pending";
-    const sub = diag ? (diag.summary || "") : "Awaiting the next analysis pass.";
+    const attempts = r.analysis_attempts || 0;
+    const failed = !diag && attempts > 0;
+    let label, sub;
+    if (diag) {
+      label = '<b>' + (diag.reason_label || diag.reason) + "</b>";
+      sub = diag.summary || "";
+    } else if (failed) {
+      const gaveUp = d.max_attempts != null && attempts >= d.max_attempts;
+      label = '<b>analysis failed</b> <span class="muted">(' + attempts +
+        " attempt" + (attempts === 1 ? "" : "s") + ")</span>";
+      sub = (gaveUp ? "Phoenix could not be queried \u2014 giving up: " : "Phoenix failed: ") +
+        (r.analysis_error || "unknown error") + (gaveUp ? "" : " \u2014 retrying.");
+    } else {
+      label = "analysis pending";
+      sub = "Awaiting the next analysis pass.";
+    }
     return "<tr>" +
       '<td class="when">' + whenCell(r.start_local) + "</td>" +
       '<td class="num">' + fmtMoney(r.spend, cur) + "</td>" +
       '<td class="num">' + (diag ? diag.request_count : "—") + "</td>" +
       '<td class="num">' + cacheCell(diag) + "</td>" +
       '<td class="summary">' + label + "<div>" + sub + "</div></td>" +
-      '<td>' + chipFor(diag) + "</td>" +
+      '<td>' + chipFor(diag, failed) + "</td>" +
       "</tr>";
   }).join("");
   anote.textContent = d.has_more ? "Showing the most recent intervals." : "";

@@ -195,6 +195,7 @@ network and pointed at it:
 | `PHOENIX_WINDOW_PAD_SECONDS` | `60`                    | Widen each interval when querying Phoenix (traces bound on start). |
 | `ANALYSIS_INTERVAL`      | `10m`                       | Analysis job cadence (APScheduler). |
 | `MAX_DIAGNOSE_PER_RUN`   | `25`                        | Cap on Phoenix dives per pass (bounds query volume). |
+| `ANALYSIS_MAX_ATTEMPTS`  | `5`                         | Phoenix dives to attempt for one window before marking it failed (stops endless retries of a stuck window). |
 | `BURST_GAP_SLICES`       | `1`                         | Quiet slices tolerated *inside* a burst before it splits. |
 | `BURST_MERGE_GAP_SLICES` | `1`                         | Quiet slices allowed *between* two bursts before they are merged into one event. |
 | `ATTRIBUTION_LAG_SLICES` | `1`                         | Slices of metering lag allowed when attributing spans to a burst. |
@@ -312,6 +313,16 @@ cursor for paging back) and `POST /analysis/backfill` (run a pass on demand).
 A startup + periodic backfill keeps the table populated once Phoenix is
 reachable. `POST /analysis/backfill` is the fastest way to get a first table to
 sanity-check the heuristics.
+
+A dive that fails (Phoenix timeout / unreachable / HTTP error) is recorded on
+the interval itself: `analysis_attempts`, `analysis_error` and `last_attempt_at`
+are stored, and the window is retried on later passes up to
+`ANALYSIS_MAX_ATTEMPTS`. After that it is left undiagnosed but **marked failed**
+— the table shows "analysis failed" with the reason (and the chip turns red)
+rather than a perpetual "Awaiting the next analysis pass", and `high_interval_diagnoses`
+surfaces the same fields for agents. So an interval that stays unanalysed is now
+diagnosable at a glance: an empty error means "no pass yet", a populated one
+means "the pass ran and Phoenix failed".
 
 For agent follow-up, the MCP server exposes `high_interval_diagnoses` (filter by
 `status` = actionable / investigate / benign / pending, or by `reason`), which

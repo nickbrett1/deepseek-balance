@@ -778,3 +778,67 @@ def test_snapshot_pair_round_trips_through_db(tmp_path):
     assert got["balance_start"] - got["balance_end"] == pytest.approx(got["window_spend"])
     assert got["prior_burst_start_utc"] == "2026-09-11T13:10:00+00:00"
     assert got["prior_burst_reason"] == "high_activity_cached"
+
+
+# --- Phoenix dive failures are recorded and bounded --------------------------
+
+class _FailingPhoenix:
+    """Phoenix stub whose every dive fails, like a hanging/unreachable server."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def fetch_llm_spans(self, start, end, pad_seconds=0):
+        self.calls += 1
+        raise OSError("timed out")
+
+
+def test_failed_dives_are_recorded_and_bounded(tmp_path):
+    """A Phoenix fetch failure is stored (not silently swallowed) and retried
+    only up to `max_attempts`, so a stuck window cannot be retried forever."""
+    db = BalanceDB(str(tmp_path / "fail.db"))
+    phoenix = _FailingPhoenix()
+    svc = AnalysisService(db, phoenix, lookback_days=1, max_attempts=3)
+    now = datetime.now(UTC).replace(tzinfo=UTC)
+    _seed_balance(db, now, spend_total=100.0)
+
+    for _ in range(3):
+        report = svc.run(now=now)
+        assert report["diagnose_failed"] >= 1
+
+    rows, _ = db.high_intervals_with_diagnostics(limit=25)
+    assert rows
+    r = rows[0]
+    assert r["diagnosis"] is None                     # still not diagnosed
+    assert r["analysis_attempts"] == 3                # failure recorded...
+    assert "timed out" in (r["analysis_error"] or "")  # ...with the reason
+
+    # Bounded: at the cap the window is no longer queried.
+    calls_before = phoenix.calls
+    report = svc.run(now=now)
+    assert report["diagnose_failed"] == 0
+    assert report["diagnose_exhausted"] >= 1
+    assert phoenix.calls == calls_before, "exhausted window must not be re-queried"
+
+    # A failed window is still visible to agents (LEFT JOIN), not hidden.
+    detailed = db.high_intervals_detailed(limit=25)
+    assert any(d["diagnosis"] is None and d["analysis_error"] for d in detailed)
+
+
+def test_diagnosis_clears_recorded_failure(tmp_path):
+    """When a later dive succeeds, the failure state is cleared from the row."""
+    db = BalanceDB(str(tmp_path / "recover.db"))
+    start = "2026-09-11T13:15:00+00:00"
+    db.record_high_interval(
+        start_utc=start, end_utc="2026-09-11T13:20:00+00:00", slice_minutes=5,
+        spend=0.06, spike_threshold=0.02, median_interval=0.01, day="2026-09-11",
+        detected_at=start,
+    )
+    db.record_analysis_failure(start_utc=start, error="timed out", at=start)
+    rows, _ = db.high_intervals_with_diagnostics(limit=5)
+    assert rows[0]["analysis_error"] == "timed out"
+
+    db.upsert_diagnostic(start_utc=start, diag=_diag())
+    rows, _ = db.high_intervals_with_diagnostics(limit=5)
+    assert rows[0]["diagnosis"] is not None
+    assert rows[0]["analysis_error"] is None

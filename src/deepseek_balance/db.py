@@ -48,7 +48,13 @@ CREATE TABLE IF NOT EXISTS high_intervals (
   -- lag the reconciler allowed when it reconciled this burst.
   burst_id TEXT,
   member_slice_count INTEGER,
-  lag_slices INTEGER
+  lag_slices INTEGER,
+  -- Phoenix-dive health: how many times we tried, the last failure (NULL once a
+  -- diagnosis lands), and when. Bounds retries so a window whose Phoenix query
+  -- keeps failing is reported as failed rather than "pending" forever.
+  analysis_attempts INTEGER DEFAULT 0,
+  analysis_error TEXT,
+  last_attempt_at TEXT
 );
 
 -- The Phoenix-trace diagnosis for a high interval. Keyed by the same UTC
@@ -165,6 +171,9 @@ class BalanceDB:
                 ("burst_id", "TEXT"),
                 ("member_slice_count", "INTEGER"),
                 ("lag_slices", "INTEGER"),
+                ("analysis_attempts", "INTEGER"),
+                ("analysis_error", "TEXT"),
+                ("last_attempt_at", "TEXT"),
             ):
                 if name not in interval_cols:
                     self._conn.execute(
@@ -281,18 +290,52 @@ class BalanceDB:
     def high_intervals_unanalyzed(
         self, since_utc: str, limit: int = 200
     ) -> list[dict]:
-        """Recorded high intervals since `since_utc` that lack a diagnosis yet."""
+        """Recorded high intervals since `since_utc` that lack a diagnosis yet.
+
+        Ordered by fewest attempts first (then newest), so a window whose
+        Phoenix query keeps failing cannot starve the ones that would succeed:
+        each pass works through the least-tried rows before retrying a stuck one.
+        """
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT h.* FROM high_intervals h
                 LEFT JOIN interval_diagnostics d ON d.start_utc = h.start_utc
                 WHERE h.start_utc >= ? AND d.start_utc IS NULL
-                ORDER BY h.start_utc DESC LIMIT ?
+                ORDER BY COALESCE(h.analysis_attempts, 0) ASC, h.start_utc DESC
+                LIMIT ?
                 """,
                 (since_utc, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_analysis_failure(
+        self, *, start_utc: str, error: str, at: str
+    ) -> int:
+        """Record a failed Phoenix dive for one high interval; return the attempt count.
+
+        Increments ``analysis_attempts`` and stores ``analysis_error`` /
+        ``last_attempt_at`` so the failure is durable and visible (the row keeps
+        its "no diagnosis" state, but the UI can say *why* instead of implying a
+        pass is still coming). The attempt count is what bounds retries.
+        """
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE high_intervals
+                SET analysis_attempts = COALESCE(analysis_attempts, 0) + 1,
+                    analysis_error = ?,
+                    last_attempt_at = ?
+                WHERE start_utc = ?
+                """,
+                (error, at, start_utc),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT analysis_attempts FROM high_intervals WHERE start_utc = ?",
+                (start_utc,),
+            ).fetchone()
+        return int(row["analysis_attempts"]) if row and row["analysis_attempts"] else 0
 
     def high_intervals_between(self, start_utc: str, end_utc: str) -> list[dict]:
         """Recorded high intervals overlapping ``[start_utc, end_utc]``.
@@ -429,6 +472,11 @@ class BalanceDB:
                     "spend": r["spend"],
                     "day": r["day"],
                     "diagnosis": diag,
+                    # Phoenix-dive health, so the table can distinguish "not yet
+                    # attempted" from "attempted N times and Phoenix failed".
+                    "analysis_attempts": r.get("analysis_attempts") or 0,
+                    "analysis_error": r.get("analysis_error"),
+                    "last_attempt_at": r.get("last_attempt_at"),
                 }
             )
         return out, has_more
@@ -439,17 +487,19 @@ class BalanceDB:
         limit: int = 500,
         include_signals: bool = True,
     ) -> list[dict]:
-        """Diagnosed high intervals (newest first) with the full stored
-        diagnosis, optionally including the raw signals payload that the
-        heuristics kept for tuning and deeper inspection.
+        """High intervals (newest first) with the full stored diagnosis when one
+        exists, optionally including the raw signals payload that the heuristics
+        kept for tuning and deeper inspection.
 
-        Unlike high_intervals_with_diagnostics, which drives the compact table
-        and returns only display fields, this returns the complete diagnostic
-        row, which is what an agent investigating an interval wants.
+        Uses a LEFT JOIN so a not-yet-diagnosed (or failed) interval is still
+        returned — with ``diagnosis`` None and its ``analysis_attempts`` /
+        ``analysis_error`` health fields — rather than silently vanishing from
+        the agent's view. Unlike high_intervals_with_diagnostics, which drives
+        the compact table, this returns the complete diagnostic row.
         """
         sql = (
             "SELECT h.*, d.* FROM high_intervals h "
-            "INNER JOIN interval_diagnostics d ON d.start_utc = h.start_utc "
+            "LEFT JOIN interval_diagnostics d ON d.start_utc = h.start_utc "
             "ORDER BY h.start_utc DESC LIMIT ?"
         )
         with self._lock:
@@ -470,7 +520,9 @@ class BalanceDB:
                     "slice_minutes": r["slice_minutes"],
                     "spend": r["spend"],
                     "day": r["day"],
-                    "diagnosis": {
+                    "analysis_attempts": r.get("analysis_attempts") or 0,
+                    "analysis_error": r.get("analysis_error"),
+                    "diagnosis": (None if r.get("analyzed_at") is None else {
                         "reason": r["reason"],
                         "reason_label": r["reason_label"],
                         "actionable": bool(r["actionable"]),
@@ -513,7 +565,7 @@ class BalanceDB:
                         "prefix_tokens": r.get("prefix_tokens"),
                         "peak_prompt_tokens": r.get("peak_prompt_tokens"),
                         "signals": signals,
-                    },
+                    }),
                 }
             )
         return out
@@ -644,6 +696,12 @@ class BalanceDB:
                     diag.get("prefix_tokens"),
                     diag.get("peak_prompt_tokens"),
                 ),
+            )
+            # A diagnosis landed, so the row is no longer failing: clear the
+            # stored error (attempts are kept as an audit trail).
+            self._conn.execute(
+                "UPDATE high_intervals SET analysis_error = NULL WHERE start_utc = ?",
+                (start_utc,),
             )
             self._conn.commit()
 
