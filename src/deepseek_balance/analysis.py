@@ -39,6 +39,14 @@ DEFAULT_LOOKBACK_DAYS = 3          # how many complete days back to detect highs
 DEFAULT_PHOENIX_PAD_SECONDS = 60   # widen each interval before hitting Phoenix
 DEFAULT_MAX_DIAGNOSE_PER_RUN = 25  # cap on Phoenix dives per backfill pass
 DEFAULT_MAX_HIGH_TO_RECORD = 200   # cap on intervals recorded per pass
+# A Phoenix dive that keeps failing (timeout / connection / HTTP error) must not
+# be retried every pass forever: after this many attempts it is left undiagnosed
+# but marked failed, so the table can say so instead of implying a pass is due.
+DEFAULT_MAX_ANALYSIS_ATTEMPTS = 5
+
+
+class PhoenixFetchError(RuntimeError):
+    """A Phoenix dive failed for a window (timeout / connection / HTTP error)."""
 # Burst reconciliation: one quiet slice inside a burst does not split it, and
 # the meter's observed settling lag is allowed for when attributing spans.
 DEFAULT_BURST_GAP_SLICES = 1
@@ -103,6 +111,7 @@ class AnalysisService:
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
         pad_seconds: int = DEFAULT_PHOENIX_PAD_SECONDS,
         max_diagnose_per_run: int = DEFAULT_MAX_DIAGNOSE_PER_RUN,
+        max_attempts: int | None = None,
         burst_gap_slices: int | None = None,
         attribution_lag_slices: int | None = None,
         burst_merge_gap_slices: int | None = None,
@@ -112,6 +121,11 @@ class AnalysisService:
         self.lookback_days = lookback_days
         self.pad_seconds = pad_seconds
         self.max_diagnose_per_run = max_diagnose_per_run
+        self.max_attempts = (
+            max_attempts
+            if max_attempts is not None
+            else _int_env("ANALYSIS_MAX_ATTEMPTS", DEFAULT_MAX_ANALYSIS_ATTEMPTS)
+        )
         self.burst_gap_slices = (
             burst_gap_slices
             if burst_gap_slices is not None
@@ -341,9 +355,10 @@ class AnalysisService:
             spans = self.phoenix.fetch_llm_spans(
                 fetch_start, fetch_end, pad_seconds=self.pad_seconds
             )
-        except (httpx.HTTPError, OSError, ValueError) as exc:  # leave unanalyzed
-            logger.warning("Phoenix fetch failed for %s: %s", high["start_utc"], exc)
-            return None
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            # Surface the failure to the caller so it is recorded and bounded,
+            # rather than silently leaving the window "pending" forever.
+            raise PhoenixFetchError(str(exc)) from exc
         spans = self._owned_spans(spans, high, lag_slices)
         member_spend = high["spend"] or 0.0
         # Denominator = the drop over the traced (lag-padded) window, not the
@@ -429,10 +444,31 @@ class AnalysisService:
             reach_start, limit=self.max_diagnose_per_run
         )
         diagnosed = 0
+        failed = 0
+        exhausted = 0
         for high in unanalyzed:
-            diag = self._diagnose(high)
-            if diag is None:
-                continue  # transient phoenix failure — retried next pass
+            # A window whose Phoenix query keeps failing is retried a bounded
+            # number of times; after that it is left marked failed (see
+            # record_analysis_failure) rather than re-queried every pass.
+            if (high.get("analysis_attempts") or 0) >= self.max_attempts:
+                exhausted += 1
+                continue
+            try:
+                diag = self._diagnose(high)
+            except PhoenixFetchError as exc:
+                attempts = self.db.record_analysis_failure(
+                    start_utc=high["start_utc"],
+                    error=str(exc),
+                    at=now_utc.isoformat(),
+                )
+                logger.warning(
+                    "Phoenix fetch failed for %s (attempt %d/%d): %s",
+                    high["start_utc"], attempts, self.max_attempts, exc,
+                )
+                failed += 1
+                continue
+            if diag is None:  # Phoenix not configured (no dive was attempted)
+                continue
             self.db.upsert_diagnostic(start_utc=high["start_utc"], diag=diag)
             diagnosed += 1
 
@@ -440,6 +476,9 @@ class AnalysisService:
             "lookback_days": self.lookback_days,
             "high_intervals_known": len(recorded),
             "newly_diagnosed": diagnosed,
+            "diagnose_failed": failed,
+            "diagnose_exhausted": exhausted,
+            "max_attempts": self.max_attempts,
             "remaining_unanalyzed": len(self.db.high_intervals_unanalyzed(reach_start)),
             "phoenix_configured": self.phoenix is not None,
         }
