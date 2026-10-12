@@ -22,6 +22,11 @@ logger = logging.getLogger("deepseek_balance.phoenix")
 
 DEFAULT_BASE_URL = "http://localhost:6006"
 DEFAULT_PROJECT = "default"
+# Per-request timeout for a spans query. Phoenix plans each query server-side and
+# can take several seconds even for a small page (observed ~7.5s for limit=1
+# under memory pressure), and the client walks every page, so a too-tight value
+# turns a merely-slow Phoenix into a permanent "fetch failed: timed out".
+DEFAULT_TIMEOUT_SECONDS = 60.0
 SPANS_PATH = "/v1/projects/{project}/spans"
 PAGE_SIZE = 200
 
@@ -191,7 +196,7 @@ class PhoenixClient:
         *,
         base_url: str | None = None,
         project: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
@@ -266,9 +271,14 @@ def client_from_env() -> PhoenixClient:
     missing config — callers decide whether Phoenix is configured)."""
     import os
 
+    try:
+        timeout = float(os.environ.get("PHOENIX_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_TIMEOUT_SECONDS
     return PhoenixClient(
         base_url=os.environ.get("PHOENIX_BASE_URL"),
         project=os.environ.get("PHOENIX_PROJECT", DEFAULT_PROJECT),
+        timeout=timeout,
     )
 
 

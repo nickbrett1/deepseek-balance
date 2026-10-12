@@ -193,6 +193,7 @@ network and pointed at it:
 | `PHOENIX_PROJECT`        | `default`                   | Phoenix project holding the LiteLLM/deepseek spans. |
 | `ANALYSIS_LOOKBACK_DAYS` | `3`                         | Complete days back to detect high intervals for. |
 | `PHOENIX_WINDOW_PAD_SECONDS` | `60`                    | Widen each interval when querying Phoenix (traces bound on start). |
+| `PHOENIX_TIMEOUT_SECONDS` | `60`                       | Per-request timeout for a Phoenix spans query. Phoenix can be slow (seconds even for a small page); too tight a value makes every dive "timed out". |
 | `ANALYSIS_INTERVAL`      | `10m`                       | Analysis job cadence (APScheduler). |
 | `MAX_DIAGNOSE_PER_RUN`   | `25`                        | Cap on Phoenix dives per pass (bounds query volume). |
 | `ANALYSIS_MAX_ATTEMPTS`  | `5`                         | Phoenix dives to attempt for one window before marking it failed (stops endless retries of a stuck window). |
