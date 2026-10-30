@@ -1,9 +1,10 @@
 """Minimal read-only client for Arize Phoenix traces.
 
 Lets the analysis layer pull LLM spans over a time window so it can explain
-why a spend interval was unusually high. Talks to the unauthenticated REST API
-documented in the "phoenix-query-interface" memo (Phoenix container on the
-``ai_proxy`` network at ``http://phoenix:6006``, data in project ``default``).
+why a spend interval was unusually high. Talks to the REST API documented in
+the "phoenix-query-interface" memo (Phoenix container on the ``ai_proxy``
+network at ``http://phoenix:6006``, data in project ``default``). Phoenix 21+
+requires an API key for any non-loopback bind; pass it as ``PHOENIX_API_KEY``.
 
 Only what the heuristics need is exposed here: fetch LLM spans in a window
 (fully paginated) and small helpers to read span attributes by dotted path.
@@ -197,12 +198,17 @@ class PhoenixClient:
         base_url: str | None = None,
         project: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        api_key: str | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.project = project or DEFAULT_PROJECT
         self._owns_client = client is None
-        self._client = client or httpx.Client(timeout=timeout)
+        # Phoenix 21+ enables auth for non-loopback binds, so /v1 rejects
+        # anonymous requests. Set the header on the client, not per call, so an
+        # injected `client` keeps whatever auth it was built with.
+        headers = {"authorization": f"Bearer {api_key}"} if api_key else {}
+        self._client = client or httpx.Client(timeout=timeout, headers=headers)
 
     def fetch_llm_spans(self, start_iso: str, end_iso: str, *, pad_seconds: int = 0) -> list[dict]:
         """Fully paginate LLM spans with ``start_iso <= start < end_iso``.
@@ -279,6 +285,7 @@ def client_from_env() -> PhoenixClient:
         base_url=os.environ.get("PHOENIX_BASE_URL"),
         project=os.environ.get("PHOENIX_PROJECT", DEFAULT_PROJECT),
         timeout=timeout,
+        api_key=os.environ.get("PHOENIX_API_KEY") or None,
     )
 
 
