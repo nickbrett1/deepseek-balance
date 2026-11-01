@@ -648,9 +648,26 @@ HISTORY_HTML = """<!DOCTYPE html>
   .chip.ok { background:rgba(52,211,153,.15); color:#6ee7b7; }
   .chip.pend { background:rgba(148,163,184,.15); color:#94a3b8; }
   .chip.fail { background:rgba(248,113,113,.18); color:#fca5a5; }
-  table#ahi td.summary { max-width:420px; }
+  table#ahi td.summary { max-width:420px; overflow-wrap:anywhere; word-break:break-word; }
   table#ahi td.summary b { color:#e2e8f0; }
-  table#ahi td.summary div { opacity:.75; }
+  table#ahi td.summary div { opacity:.75; overflow-wrap:anywhere; }
+  /* Phones: six columns cannot share one row without pushing the table past the
+     viewport. Let headers and cells wrap instead of forcing a min-width, and
+     break long tokens (model ids, URLs in error text) so the diagnosis text
+     wraps inside its column rather than widening the page. */
+  @media (max-width: 600px) {
+    body { padding: 12px 10px 26px; }
+    table#ahi { table-layout: fixed; }
+    table#ahi th { white-space: normal; }
+    table#ahi th, table#ahi td { padding: 5px 4px; font-size: 11px; overflow-wrap: anywhere; }
+    table#ahi th:nth-child(1), table#ahi td:nth-child(1) { width: 18%; }
+    table#ahi th:nth-child(2), table#ahi td:nth-child(2) { width: 12%; }
+    table#ahi th:nth-child(3), table#ahi td:nth-child(3) { width: 8%; }
+    table#ahi th:nth-child(4), table#ahi td:nth-child(4) { width: 10%; }
+    table#ahi th:nth-child(6), table#ahi td:nth-child(6) { width: 20%; }
+    table#ahi td.when { white-space: normal; }
+    table#ahi td.summary { max-width: none; }
+  }
 </style>
 </head>
 <body>
