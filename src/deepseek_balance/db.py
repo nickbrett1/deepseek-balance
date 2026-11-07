@@ -114,6 +114,18 @@ def _json(value) -> str | None:
     return json.dumps(value) if value is not None else None
 
 
+def _money_differs(a: float | None, b: float | None, *, tol: float = 1e-6) -> bool:
+    """True when two USD figures differ beyond storage noise.
+
+    Spend is a sum of cent-quantized drops, so an exact float compare would
+    invalidate a diagnosis on a bit-level wobble; a sub-cent tolerance keeps
+    re-diagnosis tied to a real change in the burst's money.
+    """
+    if a is None or b is None:
+        return a is not b
+    return abs(float(a) - float(b)) > tol
+
+
 class BalanceDB:
     """Thin thread-safe wrapper around a WAL-mode SQLite connection."""
 
@@ -252,8 +264,27 @@ class BalanceDB:
         member_slice_count: int | None = None,
         lag_slices: int | None = None,
     ) -> None:
-        """Idempotently record one unusually-high interval / burst (upsert on start)."""
+        """Idempotently record one unusually-high interval / burst (upsert on start).
+
+        Detection can *grow* a burst after it was first recorded (later balance
+        snapshots reveal that a flush was spread over more slices). Its extent
+        and spend are the denominator the diagnosis divides into, so a diagnosis
+        computed for the old shape is stale and must be invalidated: otherwise
+        ``high_intervals_unanalyzed`` never returns the row again and the table
+        keeps a 679% ratio for a burst that now reconciles at ~100%. The same
+        guard catches a diagnosis whose stored burst bounds no longer match.
+        """
         with self._lock:
+            prev = self._conn.execute(
+                "SELECT end_utc, spend, member_slice_count FROM high_intervals "
+                "WHERE start_utc = ?",
+                (start_utc,),
+            ).fetchone()
+            diag = self._conn.execute(
+                "SELECT burst_end_utc, burst_spend FROM interval_diagnostics "
+                "WHERE start_utc = ?",
+                (start_utc,),
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO high_intervals (
@@ -278,6 +309,28 @@ class BalanceDB:
                     burst_id, member_slice_count, lag_slices,
                 ),
             )
+            shape_changed = prev is not None and (
+                prev["end_utc"] != end_utc
+                or _money_differs(prev["spend"], spend)
+                or (prev["member_slice_count"] or 1) != (member_slice_count or 1)
+            )
+            diag_stale = diag is not None and (
+                diag["burst_end_utc"] != end_utc
+                or (
+                    diag["burst_spend"] is not None
+                    and _money_differs(diag["burst_spend"], spend)
+                )
+            )
+            if shape_changed or diag_stale:
+                self._conn.execute(
+                    "DELETE FROM interval_diagnostics WHERE start_utc = ?",
+                    (start_utc,),
+                )
+                self._conn.execute(
+                    "UPDATE high_intervals SET analysis_attempts = 0, "
+                    "analysis_error = NULL WHERE start_utc = ?",
+                    (start_utc,),
+                )
             self._conn.commit()
 
     def _high_row(self, start_utc: str) -> dict | None:

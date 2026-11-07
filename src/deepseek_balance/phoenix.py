@@ -164,11 +164,17 @@ def span_metrics(span: dict) -> dict:
     finish = finish or []
     is_tool_call = any(str(f).lower() in ("tool_calls", "tool_call") for f in finish)
 
-    model = (
-        attr(span, "gen_ai.response.model")
-        or attr(span, "litellm.provider.model")
-        or attr(span, "gen_ai.request.model")
+    # Three model fields, deliberately kept separate. ``gen_ai.response.model``
+    # is the model that actually served the call and is what pricing must use;
+    # the provider/request fields can disagree with it (a routing mismatch), and
+    # silently collapsing that disagreement is how a cost-bearing model ends up
+    # booked at $0.00 in the per-model breakdown.
+    response_model = attr(span, "gen_ai.response.model")
+    provider_model = attr(span, "litellm.provider_model") or attr(
+        span, "litellm.provider.model"
     )
+    request_model = attr(span, "gen_ai.request.model")
+    model = response_model or provider_model or request_model
     status = (span.get("status_code") or "").upper()
 
     return {
@@ -184,6 +190,9 @@ def span_metrics(span: dict) -> dict:
         "cache_hit_ratio": (cache_read / input_tokens) if input_tokens else None,
         "is_tool_call": bool(is_tool_call),
         "model": model,
+        "response_model": response_model,
+        "provider_model": provider_model,
+        "request_model": request_model,
         "status_code": status,
         "is_error": status == "ERROR",
     }

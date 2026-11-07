@@ -237,6 +237,9 @@ def summarize(
     # conversation id -> [(start_time, prompt_tokens, cache_read_tokens)] — the
     # turn sequence that the `cache_prefix_unstable` signature is read from.
     conversation_turns: dict[str, list[tuple[str, float, float]]] = {}
+    # Pricing-integrity gaps: spans whose provider/response model disagree, and
+    # models that carry requests but no dollars. Keyed so spans aggregate.
+    pricing_gaps: dict[tuple[str, str], dict] = {}
 
     for span in spans:
         m = _span_metrics(span)
@@ -263,6 +266,29 @@ def summarize(
         if m["is_tool_call"]:
             tool_calls += 1
 
+        # A provider that says "gemini/gemini-flash-latest" while the response
+        # says "deepseek-v4-flash" is being priced on the wrong rate card. The
+        # dollars are real (litellm.cost.total) but they sit outside the
+        # token-derived reconciliation, so surface them explicitly rather than
+        # letting the model disappear into a $0.00 row.
+        provider_model = m.get("provider_model")
+        response_model = m.get("response_model")
+        if _model_name_differs(provider_model, response_model):
+            key = ("provider_model_mismatch", _model_leaf(response_model) or "")
+            gap = pricing_gaps.setdefault(
+                key,
+                {
+                    "kind": "provider_model_mismatch",
+                    "model": response_model or provider_model,
+                    "provider_model": provider_model,
+                    "response_model": response_model,
+                    "requests": 0,
+                    "cost_usd": 0.0,
+                },
+            )
+            gap["requests"] += 1
+            gap["cost_usd"] += m["cost"] or 0.0
+
         model_key = pricing.normalize_model(m["model"])
         models_seen.add(model_key)
         band = _span_band(m, fallback_band)
@@ -272,6 +298,24 @@ def summarize(
         bucket[2] += m["output_tokens"]
 
     covered_cost = cost  # may be None if no span had a cost attribute
+
+    # A model with requests but no dollars, while the window *does* carry cost,
+    # is the other half of Defect 2: its spend is silently booked at $0.00 and
+    # it never enters the token reconciliation. Name it rather than dropping it.
+    if covered_cost and covered_cost > 0:
+        for model, reqs in model_reqs.items():
+            if reqs and not model_cost.get(model):
+                pricing_gaps.setdefault(
+                    ("zero_cost_model", model),
+                    {
+                        "kind": "zero_cost_model",
+                        "model": model,
+                        "provider_model": None,
+                        "response_model": model,
+                        "requests": reqs,
+                        "cost_usd": 0.0,
+                    },
+                )
 
     # What these tokens cost at the band they ran in, and at off-peak rates.
     expected = 0.0
@@ -320,14 +364,27 @@ def summarize(
         "models": sorted(models_seen),
     }
 
+    gap_models = {
+        g["model"] for g in pricing_gaps.values() if g["kind"] == "zero_cost_model"
+    }
+    # Include request-bearing models that carry no cost attribute at all: a
+    # model with requests and $0.00 must appear (flagged), not vanish.
+    model_totals = {m: model_cost.get(m, 0.0) for m in model_reqs}
+    ranked_models = sorted(
+        model_totals.items(),
+        key=lambda kv: (-kv[1], -model_reqs.get(kv[0], 0), kv[0]),
+    )[:4]
     top_models = []
-    for model, c in model_cost.most_common(4):
+    for model, c in ranked_models:
         top_models.append(
             {
                 "model": model,
                 "cost": c,
                 "requests": model_reqs.get(model, 0),
                 "cost_share": (c / covered_cost) if covered_cost else None,
+                # A $0.00 row is not silently benign when a pricing gap points
+                # at the same model; the flag makes the breakdown self-explanatory.
+                "pricing_gap": model in gap_models,
             }
         )
 
@@ -357,9 +414,32 @@ def summarize(
         "dominant_span_cost": top1_cost,
         "dominant_span_share": (top1_cost / covered_cost) if covered_cost else None,
         "top_models": top_models,
+        "pricing_gap": bool(pricing_gaps),
+        "pricing_gaps": sorted(
+            pricing_gaps.values(),
+            key=lambda g: (-g["cost_usd"], g["model"] or ""),
+        ),
         "explained_cost_pct": _explained_pct(reconciled, window_spend),
         "window_spend": window_spend,
     }
+
+
+def _model_leaf(name: str | None) -> str | None:
+    """The bare model name without a provider prefix (``gemini/x`` -> ``x``)."""
+    if not name:
+        return None
+    return str(name).strip().lower().split("/")[-1]
+
+
+def _model_name_differs(provider_model: str | None, response_model: str | None) -> bool:
+    """True when two non-empty model names disagree on the bare model.
+
+    Agreement is compared on the leaf name so ``deepseek/deepseek-v4-flash``
+    and ``deepseek-v4-flash`` are the same model; a genuinely different
+    provider (gemini vs deepseek) still differs.
+    """
+    a, b = _model_leaf(provider_model), _model_leaf(response_model)
+    return bool(a and b and a != b)
 
 
 def _fallback_band(window_start_utc: str | None, window_end_utc: str | None) -> str:
@@ -451,6 +531,28 @@ def _peak_note(signals: dict) -> str | None:
         f"~${premium:.2f} of this is the 2x peak-hour premium "
         f"({overlap:.0f} min of peak pricing, {pricing.get('band')} window)."
     )
+
+
+def _pricing_gap_note(signals: dict) -> str | None:
+    """A one-clause note naming a pricing-integrity gap, when there is one."""
+    gaps = signals.get("pricing_gaps") or []
+    if not gaps:
+        return None
+    gap = gaps[0]
+    if gap["kind"] == "provider_model_mismatch":
+        return (
+            f"Pricing gap: {gap['requests']} span(s) report provider model "
+            f"'{gap['provider_model']}' but were served as '{gap['response_model']}' "
+            f"— {_money(gap['cost_usd'])} of traced cost sits outside the token "
+            "reconciliation."
+        )
+    if gap["kind"] == "zero_cost_model":
+        return (
+            f"Pricing gap: {gap['requests']} request(s) for '{gap['model']}' are "
+            "booked at $0.00 while the window carries cost — their spend is not "
+            "in the token reconciliation."
+        )
+    return None
 
 
 def _double_count_suspected(signals: dict) -> bool:
@@ -662,6 +764,9 @@ def diagnose(
     note = _peak_note(signals)
     if note and decision["reason"] != "peak_pricing":
         decision["summary"] = f"{decision['summary']} {note}"
+    gap_note = _pricing_gap_note(signals)
+    if gap_note:
+        decision["summary"] = f"{decision['summary']} {gap_note}"
     decision["analyzed_at"] = analyzed_at or datetime.now(UTC).isoformat()
     pricing = signals["pricing"]
     # Merge the top-level fields the DB stores + keep the signals for tuning.
@@ -693,6 +798,10 @@ def diagnose(
         "error_count": signals["error_count"],
         "tool_call_count": signals["tool_call_count"],
         "top_models": signals["top_models"],
+        # Explicit pricing-integrity signal: a model served under one provider
+        # but billed under another, or a cost-bearing model booked at $0.00.
+        "pricing_gap": signals["pricing_gap"],
+        "pricing_gaps": signals["pricing_gaps"],
         "analyzed_at": decision["analyzed_at"],
         # Burst identity + granularity: which burst this row reconciles, how
         # many slices it folded, and the lag allowance used to attribute spans.
@@ -773,6 +882,9 @@ def diagnose_lookback(
     note = _peak_note(prior)
     if note:
         decision["summary"] = f"{decision['summary']} {note}"
+    gap_note = _pricing_gap_note(prior)
+    if gap_note:
+        decision["summary"] = f"{decision['summary']} {gap_note}"
     decision["analyzed_at"] = analyzed_at or datetime.now(UTC).isoformat()
     pricing = prior["pricing"]
     diag = {
@@ -796,6 +908,8 @@ def diagnose_lookback(
         "error_count": prior["error_count"],
         "tool_call_count": prior["tool_call_count"],
         "top_models": prior["top_models"],
+        "pricing_gap": prior["pricing_gap"],
+        "pricing_gaps": prior["pricing_gaps"],
         # The referenced burst window — this is what makes the lookback
         # auditable from the row itself rather than trusted.
         "prior_burst_start_utc": prior_start_utc,
