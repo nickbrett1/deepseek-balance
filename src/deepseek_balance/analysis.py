@@ -47,6 +47,17 @@ DEFAULT_MAX_ANALYSIS_ATTEMPTS = 5
 
 class PhoenixFetchError(RuntimeError):
     """A Phoenix dive failed for a window (timeout / connection / HTTP error)."""
+
+
+class ReconciliationNotReady(RuntimeError):
+    """The balance movement this burst must be divided into is not observable yet.
+
+    A burst is only reconcilable once the snapshot closing its **whole extent**
+    exists. Diagnosing earlier would divide a multi-minute token numerator by
+    the drop of a single member slice, which is the defect this guards (a
+    genuinely 100%-explained burst reported as ``over_attributed``). The caller
+    leaves the row ``pending`` and retries on a later pass.
+    """
 # Burst reconciliation: one quiet slice inside a burst does not split it, and
 # the meter's observed settling lag is allowed for when attributing spans.
 DEFAULT_BURST_GAP_SLICES = 1
@@ -253,24 +264,34 @@ class AnalysisService:
         """The snapshot pair whose movement this burst's traced cost explains.
 
         The traced cost covers the lag-padded window, so the balance movement
-        it is reconciled against must too: from the snapshot opening the burst
-        to the snapshot closing it **plus the settling lag**
-        (``[burst_start, burst_end + lag]``). Using only the member slices'
-        own delta — the old denominator — understated the movement whenever a
-        flush was spread over several snapshots and reported a spurious
-        ``over_attributed`` (see the reconciliation memo).
+        it is reconciled against must cover the same time extent: from the
+        snapshot opening the burst to the snapshot closing its **whole extent
+        plus the settling lag** (``[burst_start, burst_end + lag]``).
 
-        Returns ``(drop, start_row, end_row)`` or ``None`` when either grid slot
-        has no snapshot (the caller then falls back to the member-slice delta).
+        The closing slot is ``burst_end + lag`` when that snapshot exists and
+        ``burst_end`` otherwise. The latter still spans the whole burst — the
+        settling lag only adds an idle tail — so it is a valid denominator;
+        what is *never* valid is a single member slice's delta next to a
+        multi-minute numerator. Using that was the defect: a 5-slice burst was
+        reconciled against its first 5-minute tick and a genuinely
+        100%-explained burst was reported at 679% / ``over_attributed``.
+
+        Returns ``(drop, start_row, end_row)`` or ``None`` when the burst's
+        opening or closing grid slot has no snapshot (the caller then defers
+        diagnosis rather than falling back to the member-slice delta).
         """
         start = self.db.snapshot_at(high["start_utc"])
-        end_slot = _shift(high["end_utc"], lag_seconds)
-        end = self.db.snapshot_at(end_slot)
-        if not start or not end:
+        if not start or start["total_balance"] is None:
             return None
-        if start["total_balance"] is None or end["total_balance"] is None:
-            return None
-        return start["total_balance"] - end["total_balance"], start, end
+        for end_slot in (_shift(high["end_utc"], lag_seconds), high["end_utc"]):
+            end = self.db.snapshot_at(end_slot)
+            if end and end["total_balance"] is not None:
+                return (
+                    start["total_balance"] - end["total_balance"],
+                    start,
+                    end,
+                )
+        return None
 
     def _attach_balance_pair(self, diag: dict, high: dict, lag_seconds: float) -> None:
         """Record the snapshot pair whose drop this window explains (T2).
@@ -315,6 +336,16 @@ class AnalysisService:
             return self.attribution_lag_slices
         return 0
 
+    @staticmethod
+    def _is_burst_row(high: dict) -> bool:
+        """True for a recorded burst (as opposed to a bare interval dict).
+
+        A recorded row always carries the burst identity and its attribution
+        lag; a bare dict passed straight to ``_diagnose`` (tests, ad-hoc) has
+        neither and keeps the legacy member-delta fallback.
+        """
+        return high.get("burst_id") is not None or high.get("lag_slices") is not None
+
     def _owned_spans(self, spans: list[dict], high: dict, lag_slices: int) -> list[dict]:
         """Keep only the spans this burst owns when lag windows overlap.
 
@@ -349,6 +380,16 @@ class AnalysisService:
         lag_slices = self._lag_slices(high)
         slice_minutes = high.get("slice_minutes") or _int_env("SPEND_SLICE_MINUTES", 5)
         lag_seconds = lag_slices * slice_minutes * 60
+        # Denominator = the drop over the traced window's extent, never one
+        # member slice. A recorded burst whose closing snapshot is not
+        # observable yet is deferred (left pending) instead of being divided
+        # by a single slice's delta.
+        pair = self._reconciliation_pair(high, lag_seconds)
+        if pair is None and self._is_burst_row(high):
+            raise ReconciliationNotReady(
+                f"no balance snapshot closes burst {high['start_utc']} "
+                f"→ {high['end_utc']} yet"
+            )
         fetch_start = _shift(high["start_utc"], -lag_seconds)
         fetch_end = _shift(high["end_utc"], lag_seconds)
         try:
@@ -361,10 +402,9 @@ class AnalysisService:
             raise PhoenixFetchError(str(exc)) from exc
         spans = self._owned_spans(spans, high, lag_slices)
         member_spend = high["spend"] or 0.0
-        # Denominator = the drop over the traced (lag-padded) window, not the
-        # member slices' own delta. Only fall back to the member delta when the
-        # grid has no snapshot at one end of the reconciliation span.
-        pair = self._reconciliation_pair(high, lag_seconds)
+        # A bare window (no burst identity) has no recorded extent to cover, so
+        # its own member delta is the best denominator available; a recorded
+        # burst always uses the snapshot pair above.
         window_spend = pair[0] if pair is not None else member_spend
         diag = heuristics.diagnose(
             spans,
@@ -446,6 +486,7 @@ class AnalysisService:
         diagnosed = 0
         failed = 0
         exhausted = 0
+        deferred = 0
         for high in unanalyzed:
             # A window whose Phoenix query keeps failing is retried a bounded
             # number of times; after that it is left marked failed (see
@@ -467,6 +508,12 @@ class AnalysisService:
                 )
                 failed += 1
                 continue
+            except ReconciliationNotReady:
+                # The burst's closing snapshot has not been polled yet, so its
+                # denominator does not exist. Leave it pending and retry next
+                # pass — never divide by one member slice.
+                deferred += 1
+                continue
             if diag is None:  # Phoenix not configured (no dive was attempted)
                 continue
             self.db.upsert_diagnostic(start_utc=high["start_utc"], diag=diag)
@@ -478,6 +525,7 @@ class AnalysisService:
             "newly_diagnosed": diagnosed,
             "diagnose_failed": failed,
             "diagnose_exhausted": exhausted,
+            "diagnose_deferred": deferred,
             "max_attempts": self.max_attempts,
             "remaining_unanalyzed": len(self.db.high_intervals_unanalyzed(reach_start)),
             "phoenix_configured": self.phoenix is not None,

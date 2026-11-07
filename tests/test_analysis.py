@@ -373,7 +373,12 @@ def test_fetch_llm_spans_paginates():
 def _seed_balance(db, now, spend_total):
     """Write balance snapshots for 'today' that sum to `spend_total` of spend
     in a handful of 5-min slices, old enough that today has enough intervals."""
-    start = datetime.now(UTC).replace(tzinfo=UTC) - timedelta(hours=3)
+    # Snapshots live on the 5-minute poll grid (the analysis reconciles a burst
+    # against the grid slot that closes its extent), so seed aligned slots.
+    now_utc = datetime.now(UTC).replace(tzinfo=UTC)
+    aligned = now_utc.replace(minute=now_utc.minute - now_utc.minute % 5, second=0,
+                              microsecond=0)
+    start = aligned - timedelta(hours=3)
     bal = 1000.0
     # several equal drops (normal) then one big drop (the spike)
     n_small = 12
@@ -842,3 +847,245 @@ def test_diagnosis_clears_recorded_failure(tmp_path):
     rows, _ = db.high_intervals_with_diagnostics(limit=5)
     assert rows[0]["diagnosis"] is not None
     assert rows[0]["analysis_error"] is None
+
+
+# --- Regression: the 2026-11-07T15:25Z burst (denominator extent) -----------
+
+_MEMO_ROW_START = "2026-11-07T15:25:00+00:00"
+_MEMO_ROW_END = "2026-11-07T15:50:00+00:00"
+# The live token window: 8,422,403 prompt (6,590,557 cached) and 74,919 output
+# off-peak. Priced at DeepSeek Flash's published off-peak rates this is
+# $0.339499971; the balance drop over the whole burst is exactly $0.34.
+_MEMO_ROW_SPEND = 0.34
+_MEMO_ROW_TRACED = 0.3395001
+
+
+def _memo_row_spans() -> list[dict]:
+    """30 spans totalling exactly the live row's tokens and litellm cost."""
+    per_span_cost = 1.263089427 / 30
+    n = 29
+    spans = [
+        _span(
+            "deepseek-v4-flash",
+            input=280_747,
+            cached=219_685,
+            output=2_497,
+            cost=per_span_cost,
+            start="2026-11-07T15:26:00+00:00",
+        )
+        for _ in range(n)
+    ]
+    spans.append(
+        _span(
+            "deepseek-v4-flash",
+            input=8_422_403 - n * 280_747,
+            cached=6_590_557 - n * 219_685,
+            output=74_919 - n * 2_497,
+            cost=per_span_cost,
+            start="2026-11-07T15:26:00+00:00",
+        )
+    )
+    return spans
+
+
+def _seed_memo_row_snapshots(
+    db: BalanceDB, *, drop_at: str = _MEMO_ROW_END, through: str | None = None
+) -> None:
+    """The live balance curve: 15.67 at the burst open, 15.33 by 15:50."""
+    for slot, bal in (
+        ("2026-11-07T15:25:00+00:00", 15.67),
+        ("2026-11-07T15:30:00+00:00", 15.62),
+        ("2026-11-07T15:35:00+00:00", 15.58),
+        ("2026-11-07T15:40:00+00:00", 15.50),
+        ("2026-11-07T15:45:00+00:00", 15.39),
+        (drop_at, 15.33),
+        ("2026-11-07T15:55:00+00:00", 15.33),
+    ):
+        if through is not None and slot > through:
+            continue
+        db.insert_snapshot(
+            ts=slot.replace(":00+00:00", ":05+00:00"),
+            scheduled_ts=slot,
+            currency="USD",
+            total_balance=bal,
+            granted_balance=0.0,
+            topped_up_balance=bal,
+            is_available=True,
+            http_status=200,
+            raw="{}",
+        )
+
+
+def test_memo_row_burst_reconciles_after_extent_fix(tmp_path):
+    """Reproduce 2026-11-07T15:25Z: a 5-slice burst must reconcile ~100%.
+
+    Before the extent fix the numerator covered the ~11-minute token window
+    while the denominator was the first 5-minute tick (0.05), so a genuinely
+    fully-explained burst read 679% / ``over_attributed``. The denominator must
+    span the whole burst (0.34).
+    """
+    db = BalanceDB(str(tmp_path / "memo-row.db"))
+    _seed_memo_row_snapshots(db)
+    svc = AnalysisService(
+        db, _FakePhoenix(_memo_row_spans()), lookback_days=1, attribution_lag_slices=1
+    )
+    high = {
+        "start_utc": _MEMO_ROW_START,
+        "end_utc": _MEMO_ROW_END,
+        "slice_minutes": 5,
+        "spend": _MEMO_ROW_SPEND,
+        "burst_id": _MEMO_ROW_START,
+        "member_slice_count": 5,
+        "lag_slices": 1,
+    }
+    diag = svc._diagnose(high)
+    assert diag is not None
+    assert diag["pricing_band"] == "off_peak"
+    # The denominator is the whole burst's drop, not one member slice.
+    assert diag["window_drop"] == pytest.approx(0.34)
+    assert diag["traced_cost"] == pytest.approx(_MEMO_ROW_TRACED, abs=1e-6)
+    assert diag["explained_cost_pct"] == pytest.approx(99.85, abs=0.5)
+    assert diag["reason"] != "over_attributed"
+    assert diag["investigate"] is False
+    # The auditable pair is the burst's opening and closing snapshots.
+    assert diag["balance_start_ts"].startswith("2026-11-07T15:25")
+    assert diag["balance_end_ts"].startswith("2026-11-07T15:55")
+
+
+def test_grown_burst_invalidates_its_stale_diagnosis(tmp_path):
+    """Detection can grow a burst after it was diagnosed; the diagnosis must be
+    re-run rather than keeping a denominator for the old one-slice extent."""
+    db = BalanceDB(str(tmp_path / "grow.db"))
+    _seed_memo_row_snapshots(db, through="2026-11-07T15:30:00+00:00")
+    svc = AnalysisService(
+        db, _FakePhoenix(_memo_row_spans()), lookback_days=1, attribution_lag_slices=1
+    )
+
+    # First diagnosis ran while the burst was one slice (15:25 -> 15:30, 0.05):
+    # this is the bad row from the live DB.
+    stale = svc._diagnose(
+        {
+            "start_utc": _MEMO_ROW_START,
+            "end_utc": "2026-11-07T15:30:00+00:00",
+            "slice_minutes": 5,
+            "spend": 0.05,
+            "burst_id": _MEMO_ROW_START,
+            "member_slice_count": 1,
+            "lag_slices": 1,
+        }
+    )
+    assert stale["window_drop"] == pytest.approx(0.05)
+    assert stale["explained_cost_pct"] > 600
+    assert stale["reason"] == "over_attributed"
+
+    db.record_high_interval(
+        start_utc=_MEMO_ROW_START, end_utc="2026-11-07T15:30:00+00:00",
+        slice_minutes=5, spend=0.05, spike_threshold=0.02, median_interval=0.01,
+        day="2026-11-07", detected_at="2026-11-07T15:31:00+00:00",
+        burst_id=_MEMO_ROW_START, member_slice_count=1, lag_slices=1,
+    )
+    db.upsert_diagnostic(start_utc=_MEMO_ROW_START, diag=stale)
+
+    # A later pass detects the full burst (15:25 -> 15:50, 0.34). The stale
+    # diagnosis must be invalidated so the row is analysed again.
+    db.record_high_interval(
+        start_utc=_MEMO_ROW_START, end_utc=_MEMO_ROW_END,
+        slice_minutes=5, spend=_MEMO_ROW_SPEND, spike_threshold=0.02,
+        median_interval=0.01, day="2026-11-07",
+        detected_at="2026-11-07T15:51:00+00:00",
+        burst_id=_MEMO_ROW_START, member_slice_count=5, lag_slices=1,
+    )
+    unanalyzed = db.high_intervals_unanalyzed("2026-11-07T00:00:00+00:00")
+    assert any(r["start_utc"] == _MEMO_ROW_START for r in unanalyzed)
+
+    # The rest of the live balance curve arrives before the re-diagnosis.
+    _seed_memo_row_snapshots(db)
+    refreshed = svc._diagnose(
+        {
+            "start_utc": _MEMO_ROW_START,
+            "end_utc": _MEMO_ROW_END,
+            "slice_minutes": 5,
+            "spend": _MEMO_ROW_SPEND,
+            "burst_id": _MEMO_ROW_START,
+            "member_slice_count": 5,
+            "lag_slices": 1,
+        }
+    )
+    assert refreshed["window_drop"] == pytest.approx(0.34)
+    assert refreshed["explained_cost_pct"] == pytest.approx(99.85, abs=0.5)
+    assert refreshed["reason"] != "over_attributed"
+
+
+# --- Defect 2: pricing gaps are surfaced, not booked at $0.00 ----------------
+
+def _provider_mismatch_span() -> dict:
+    ## 20 spans of the live row carried the Gemini provider model while the
+    ## response (and therefore the token pricing) said deepseek-v4-flash.
+    span = _span(
+        "deepseek-v4-flash", input=68_820, cached=0, output=0, cost=0.054075,
+        start="2026-11-07T15:26:00+00:00",
+    )
+    span["attributes"]["litellm.provider_model"] = "gemini/gemini-flash-latest"
+    return span
+
+
+def test_provider_model_mismatch_is_surfaced_in_signals():
+    spans = [_provider_mismatch_span() for _ in range(20)]
+    signals = heuristics.summarize(
+        spans, window_spend=_MEMO_ROW_SPEND,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert signals["pricing_gap"] is True
+    gap = next(g for g in signals["pricing_gaps"]
+               if g["kind"] == "provider_model_mismatch")
+    assert gap["requests"] == 20
+    assert gap["cost_usd"] == pytest.approx(20 * 0.054075)
+    assert gap["provider_model"] == "gemini/gemini-flash-latest"
+    assert gap["response_model"] == "deepseek-v4-flash"
+    assert gap["model"] == "deepseek-v4-flash"
+
+
+def test_provider_model_mismatch_rides_into_the_diagnosis():
+    spans = [_provider_mismatch_span() for _ in range(20)]
+    diag = heuristics.diagnose(
+        spans, window_spend=_MEMO_ROW_SPEND,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["pricing_gap"] is True
+    assert diag["payload"]["signals"]["pricing_gaps"]
+    assert "pricing gap" in diag["summary"].lower()
+    assert "gemini/gemini-flash-latest" in diag["summary"]
+
+
+def test_cost_bearing_model_booked_at_zero_is_surfaced():
+    """A model with requests but $0.00 (while the window has cost) must not
+    silently vanish from the per-model breakdown."""
+    spans = [_span("deepseek-v4-flash", cost=0.01, input=1000, cached=0)
+             for _ in range(10)]
+    zero = _span("gemini-flash-latest", cost=0.0, input=1_376_404, cached=0)
+    zero["attributes"].pop("litellm.cost.total")  # no cost attribute at all
+    spans.append(zero)
+    signals = heuristics.summarize(
+        spans, window_spend=0.34,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert signals["pricing_gap"] is True
+    gap = next(g for g in signals["pricing_gaps"] if g["kind"] == "zero_cost_model")
+    assert gap["model"] == "gemini-flash-latest"
+    assert gap["requests"] == 1
+    assert gap["cost_usd"] == 0.0
+    # The $0.00 breakdown row is marked, not silently benign.
+    zero_entry = next(m for m in signals["top_models"] if m["model"] == "gemini-flash-latest")
+    assert zero_entry["cost"] == 0.0
+    assert zero_entry["pricing_gap"] is True
+
+
+# --- Defect 3: the history table names the reconciliation column -------------
+
+def test_history_table_labels_explained_pct_column():
+    from deepseek_balance import app
+
+    # "Explains" is the traced-cost ÷ balance-drop ratio; it must be its own
+    # labelled column rather than riding in the cache-hit column.
+    assert "<th>Explains</th>" in app.HISTORY_HTML
+    assert "costHint(diag)" in app.HISTORY_HTML

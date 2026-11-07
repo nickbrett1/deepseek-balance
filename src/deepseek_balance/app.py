@@ -663,8 +663,9 @@ HISTORY_HTML = """<!DOCTYPE html>
     table#ahi th:nth-child(1), table#ahi td:nth-child(1) { width: 18%; }
     table#ahi th:nth-child(2), table#ahi td:nth-child(2) { width: 12%; }
     table#ahi th:nth-child(3), table#ahi td:nth-child(3) { width: 8%; }
-    table#ahi th:nth-child(4), table#ahi td:nth-child(4) { width: 10%; }
-    table#ahi th:nth-child(6), table#ahi td:nth-child(6) { width: 20%; }
+    table#ahi th:nth-child(4), table#ahi td:nth-child(4) { width: 9%; }
+    table#ahi th:nth-child(5), table#ahi td:nth-child(5) { width: 10%; }
+    table#ahi th:nth-child(7), table#ahi td:nth-child(7) { width: 20%; }
     table#ahi td.when { white-space: normal; }
     table#ahi td.summary { max-width: none; }
   }
@@ -718,7 +719,7 @@ HISTORY_HTML = """<!DOCTYPE html>
   </div>
   <table id="ahi">
     <thead><tr>
-      <th>Interval</th><th>Spend</th><th>Req</th><th>Cache</th><th>Diagnosis</th><th>Status</th>
+      <th>Interval</th><th>Spend</th><th>Req</th><th>Cache</th><th>Explains</th><th>Diagnosis</th><th>Status</th>
     </tr></thead>
     <tbody></tbody>
   </table>
@@ -1050,7 +1051,7 @@ function renderAnalysis(d) {
       ? "No unusually-high intervals with status \u201c" + (STATUS_LABEL[ahiStatus] || ahiStatus) + "\u201d yet."
       : "No unusually-high intervals analysed yet.";
     if (!d.configured) msg += " Analysis is disabled (no PHOENIX_BASE_URL).";
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">' + msg + "</td></tr>";
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">' + msg + "</td></tr>";
     anote.textContent = !d.configured && !filtered
       ? "Set PHOENIX_BASE_URL to enable the Phoenix deep-dive." : "";
     return;
@@ -1078,6 +1079,7 @@ function renderAnalysis(d) {
       '<td class="num">' + fmtMoney(r.spend, cur) + "</td>" +
       '<td class="num">' + (diag ? diag.request_count : "—") + "</td>" +
       '<td class="num">' + cacheCell(diag) + "</td>" +
+      '<td class="num" title="traced cost \u00f7 balance drop">' + costHint(diag) + "</td>" +
       '<td class="summary">' + label + "<div>" + sub + "</div></td>" +
       '<td>' + chipFor(diag, failed) + "</td>" +
       "</tr>";

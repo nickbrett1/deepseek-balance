@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from deepseek_balance import bursts, heuristics
-from deepseek_balance.analysis import AnalysisService
+from deepseek_balance.analysis import AnalysisService, ReconciliationNotReady
 from deepseek_balance.db import BalanceDB
 from deepseek_balance.heuristics import REASONS
 
@@ -356,6 +356,11 @@ def test_analysis_widens_the_window_for_a_burst_lag(tmp_path):
         day="2026-09-15", detected_at="2026-09-15T08:25:00+00:00",
         burst_id="b1", member_slice_count=2, lag_slices=1,
     )
+    # A burst is only diagnosable once the grid slot closing its extent exists.
+    _seed_snapshots(db, {
+        "2026-09-15T08:15:00+00:00": 10.0,
+        "2026-09-15T08:25:00+00:00": 10.0 - 0.48,
+    })
     diag = svc._diagnose(burst)
     assert diag is not None
     # Window is padded by one slice (5 min) on each side.
@@ -432,9 +437,14 @@ def test_reconciliation_credits_the_drop_over_the_traced_window(tmp_path):
     assert diag["balance_end_ts"].startswith("2026-09-16T16:35")
 
 
-def test_reconciliation_falls_back_to_member_spend_without_snapshots(tmp_path):
-    """With no reconciliation snapshot the member-slice delta is used, so the
-    row still reconciles (never divides by a missing/zero window)."""
+def test_reconciliation_defers_a_burst_without_snapshots(tmp_path):
+    """No snapshot closing the burst extent => defer, never divide the token
+    numerator by one member slice.
+
+    Falling back to the member delta is exactly the 679% defect: the numerator
+    spans the whole burst, the denominator one slice. An unobservable extent
+    must leave the row pending so a later pass reconciles it properly.
+    """
     db = BalanceDB(str(tmp_path / "nosnap.db"))
     start, end = "2026-09-16T16:25:00+00:00", "2026-09-16T16:30:00+00:00"
     spans = [_span(start="2026-09-16T16:26:00+00:00", cost=0.2, input=5000, cached=4800)
@@ -446,9 +456,8 @@ def test_reconciliation_falls_back_to_member_spend_without_snapshots(tmp_path):
         "start_utc": start, "end_utc": end, "slice_minutes": 5,
         "spend": spend, "burst_id": start, "member_slice_count": 1, "lag_slices": 1,
     }
-    diag = svc._diagnose(high)
-    assert diag["window_drop"] == pytest.approx(spend)
-    assert diag["explained_cost_pct"] == pytest.approx(100.0, abs=1.0)
+    with pytest.raises(ReconciliationNotReady):
+        svc._diagnose(high)
 
 
 # --- Stage 5: burst fields round-trip ---------------------------------------
@@ -495,7 +504,10 @@ def test_analysis_detection_records_one_burst_for_adjacent_highs(tmp_path):
     burst, not two slice-local rows."""
     db = BalanceDB(str(tmp_path / "integration.db"))
     now = datetime.now(UTC)
-    ts = now - timedelta(hours=3)
+    # Seed on the 5-minute poll grid: a burst is reconciled against the grid
+    # slot closing its extent.
+    aligned = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+    ts = aligned - timedelta(hours=3)
     bal = 1000.0
     for drop in [2.0] * 12 + [20.0, 20.0]:
         bal -= drop
