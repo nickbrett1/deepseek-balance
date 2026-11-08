@@ -56,6 +56,7 @@ REASONS: dict[str, str] = {
     "high_activity_cached": "High activity — mostly cache hits / normal context",
     "cent_quantized": "Cent-quantized balance drop (measurement floor)",
     "over_attributed": "Over-attributed (traced cost exceeds the drop)",
+    "unexplained_over_attribution": "Over-attributed — reconciliation unreliable",
     "settled_from_prior_burst": "Settled from prior burst (balance-snapshot lag)",
     "unexplained": "Could not attribute — investigate",
 }
@@ -77,6 +78,29 @@ SIGNATURES: frozenset[str] = frozenset(
         "cent_quantized",
     }
 )
+
+# Verdicts that assert "nothing to see here". An unreliable reconciliation must
+# never land on one of these, however the benign branch was reached — see
+# ``MATERIAL_OVER_ATTRIBUTION_PCT``. ``unexplained_over_attribution`` is
+# deliberately *not* here, and deliberately not in ``SIGNATURES`` either: like
+# ``over_attributed`` it is an attribution-health verdict (``signature`` stays
+# None), it just says the *ratio* is untrustworthy rather than the coverage.
+BENIGN_REASONS: frozenset[str] = frozenset({"high_activity_cached", "cent_quantized"})
+
+# Material over-attribution: the band-corrected traced cost is at least this
+# percentage of the balance drop that actually left the account. Past it the
+# ratio itself is untrustworthy and the row must not be reported as benign
+# ("normal context").
+#
+# Why 150 and not something tuned to a row: a perfect reconciliation is 100%,
+# and the double-count band edge (``OVER_FACTOR``) is 200%. Between the two, a
+# ratio can only be measurement noise at the cents/single-poll scale, which is
+# a handful of percent — not 50. So 150 splits "at or around the drop" from
+# "materially more than the drop" without touching either boundary, and without
+# re-baselining ``OVER_FACTOR``/``DOUBLE_COUNT_TRACER_FACTOR`` (a genuine double
+# count still needs its own tracer fingerprint, so this constant only decides
+# whether the row may be called *benign* — never whether it is double counted).
+MATERIAL_OVER_ATTRIBUTION_PCT = 150.0
 
 # Explainability bar: if traced cost is well under half the balance drop the
 # money is not coming from the calls Phoenix saw, so mark it unexplained.
@@ -555,6 +579,102 @@ def _pricing_gap_note(signals: dict) -> str | None:
     return None
 
 
+def _mismatch_gap(signals: dict) -> dict | None:
+    """The first ``provider_model_mismatch`` pricing gap, if there is one."""
+    for gap in signals.get("pricing_gaps") or []:
+        if gap.get("kind") == "provider_model_mismatch":
+            return gap
+    return None
+
+
+def _over_attribution_evidence(signals: dict) -> dict | None:
+    """Evidence that this window's reconciliation cannot be trusted.
+
+    Two independent triggers, either sufficient:
+
+    - ``explained_cost_pct`` at or above ``MATERIAL_OVER_ATTRIBUTION_PCT``: the
+      band-corrected traced cost is materially more than the money that left the
+      account, so "the traces describe this drop" is simply not true;
+    - a ``provider_model_mismatch`` pricing gap: spans were served by one
+      provider/model and priced as another, so the token side and the traced
+      dollar side are not describing the same requests — the ratio is unreliable
+      regardless of how close to 100% it happens to land.
+
+    Returns ``None`` when the window reconciles sanely, otherwise a small block
+    that can be stored on the payload and quoted in the label.
+    """
+    gap = _mismatch_gap(signals)
+    pct = signals.get("explained_cost_pct")
+    over_threshold = pct is not None and pct >= MATERIAL_OVER_ATTRIBUTION_PCT
+    if not over_threshold and gap is None:
+        return None
+    return {
+        "explained_cost_pct": pct,
+        "multiple": (pct / 100.0) if pct is not None else None,
+        "threshold_pct": MATERIAL_OVER_ATTRIBUTION_PCT,
+        "over_threshold": over_threshold,
+        "provider_model_mismatch": gap,
+    }
+
+
+def _over_attribution_label(evidence: dict) -> str:
+    """The one-line reason label: state the multiple plainly, name the gap."""
+    multiple = evidence.get("multiple")
+    head = (
+        f"Traced cost is {multiple:.1f}x the balance drop"
+        if multiple is not None
+        else f"Traced cost is materially above the {MATERIAL_OVER_ATTRIBUTION_PCT:.0f}% "
+             "reconciliation ceiling"
+    )
+    gap = evidence.get("provider_model_mismatch")
+    if gap:
+        return (
+            f"{head} — '{gap['provider_model']}' served as '{gap['response_model']}' "
+            f"({gap['requests']} request(s), ${_money(gap['cost_usd'])}); "
+            "reconciliation unreliable"
+        )
+    return f"{head} — reconciliation unreliable"
+
+
+def _over_attribution_verdict(signals: dict, evidence: dict, *, suppressed: str) -> dict:
+    """The non-benign verdict for a materially over-attributed window."""
+    pct = evidence["explained_cost_pct"]
+    multiple = evidence.get("multiple")
+    cost = signals.get("reconciled_cost")
+    spend = signals.get("window_spend") or 0.0
+    gap = evidence.get("provider_model_mismatch")
+    if evidence.get("over_threshold") and pct is not None and multiple is not None:
+        head = (
+            f"Traced LLM cost (${_money(cost)}) is ~{pct:.0f}% ({multiple:.1f}x) the "
+            f"${_money(spend)} balance drop — materially over-attributed, so this "
+            "window cannot be called benign "
+        )
+    else:
+        # Below the ceiling the ratio looks sane; the *gap* is what makes it
+        # untrustworthy, and saying "over-attributed" here would be a lie.
+        head = (
+            f"Traced LLM cost (${_money(cost)}) reconciles at ~{pct:.0f}% of the "
+            f"${_money(spend)} balance drop, but the window is priced across "
+            "providers that do not match the models served, so the ratio is not "
+            "trustworthy and this window cannot be called benign "
+        )
+    summary = (
+        f"{head}(would have been '{suppressed}'); the reconciliation, not the "
+        "traffic, is the finding."
+    )
+    if evidence.get("over_threshold") and gap is None:
+        summary += (
+            f" (Traced cost is at or above {MATERIAL_OVER_ATTRIBUTION_PCT:.0f}% of "
+            "the drop on its own.)"
+        )
+    return _mk(
+        "unexplained_over_attribution",
+        investigate=True,
+        label=_over_attribution_label(evidence),
+        summary=summary,
+    )
+
+
 def _double_count_suspected(signals: dict) -> bool:
     """True when the raw tracer sum betrays duplicated spans.
 
@@ -578,8 +698,37 @@ def _double_count_suspected(signals: dict) -> bool:
     return litellm > factor * expected
 
 
+def _demote_if_unreliable(
+    decision: dict, signals: dict, over: dict | None
+) -> dict:
+    """Refuse a benign verdict when the window's reconciliation is unreliable."""
+    if over is not None and not decision["investigate"] and not decision["actionable"]:
+        # A benign (or otherwise "nothing to act on") verdict on a window whose
+        # reconciliation is unreliable is exactly the mask this rule exists to
+        # stop. Actionable traffic-shape verdicts are left alone: they already
+        # say *what* the traffic did, which the over-attribution does not undo.
+        return _over_attribution_verdict(
+            signals, over, suppressed=decision["reason"]
+        )
+    return decision
+
+
 def classify(signals: dict) -> dict:
-    """Pick the primary reason for a window from its aggregated signals."""
+    """Pick the primary reason, refusing to call an unreliable reconciliation benign.
+
+    The raw verdict comes from the ordered rule set; one post-condition is then
+    applied to it: a window whose reconciliation is materially over-attributed
+    (or mispriced by a provider/model mismatch) must not be reported as benign —
+    see ``_over_attribution_evidence``. Applying it here rather than at each
+    benign branch keeps the guarantee independent of how the branch was reached.
+    """
+    return _demote_if_unreliable(
+        _classify_raw(signals), signals, _over_attribution_evidence(signals)
+    )
+
+
+def _classify_raw(signals: dict) -> dict:
+    """The ordered rule set: signals -> primary reason (before the benign veto)."""
     n = signals["request_count"]
     cost = signals["reconciled_cost"]
     explained = signals["explained_cost_pct"]
@@ -772,7 +921,7 @@ def diagnose(
     # Merge the top-level fields the DB stores + keep the signals for tuning.
     diag = {
         "reason": decision["reason"],
-        "reason_label": REASONS[decision["reason"]],
+        "reason_label": decision.get("label") or REASONS[decision["reason"]],
         "signature": decision.get("signature"),
         "actionable": decision.get("actionable", False),
         "investigate": decision.get("investigate", False),
@@ -816,8 +965,13 @@ def diagnose(
         "top_conversation_id": signals["top_conversation_id"],
         "prefix_tokens": signals["prefix_tokens"],
         "peak_prompt_tokens": signals["peak_prompt_tokens"],
-        # Full signals block stored for later heuristic tuning / drill-in.
-        "payload": {"signals": signals},
+        # Full signals block stored for later heuristic tuning / drill-in, plus
+        # the reconciliation-health evidence behind an `unexplained_over_attribution`
+        # verdict so the demotion is auditable from the row alone.
+        "payload": {
+            "signals": signals,
+            "reconciliation_health": _over_attribution_evidence(signals),
+        },
     }
     return diag
 
@@ -928,9 +1082,19 @@ def diagnose_lookback(
     return diag
 
 
-def _mk(reason: str, *, actionable: bool = False, investigate: bool = False, summary: str) -> dict:
+def _mk(
+    reason: str,
+    *,
+    actionable: bool = False,
+    investigate: bool = False,
+    summary: str,
+    label: str | None = None,
+) -> dict:
     return {
         "reason": reason,
+        # A per-row label overrides the static one when the finding needs
+        # numbers in it (e.g. "Traced cost is 1.9x the balance drop").
+        "label": label,
         # Signature = the winning *traffic shape* (None for an attribution
         # verdict such as `unexplained` / `over_attributed`).
         "signature": reason if reason in SIGNATURES else None,

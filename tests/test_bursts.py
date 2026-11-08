@@ -283,9 +283,15 @@ def test_zero_or_negative_window_drop_is_unexplained_not_divided():
     assert negative["reason"] == "unexplained"
 
 
-def test_over_attribution_denominator_artifact_is_not_flagged():
+def test_over_attribution_denominator_artifact_is_not_double_counting():
     """An over-100% ratio whose tracer matches the token cost is a mis-sized
-    denominator, not double counting — it must not be actionable."""
+    denominator, not double counting — so it must not report `over_attributed`.
+
+    It must NOT be called benign either: past ``MATERIAL_OVER_ATTRIBUTION_PCT``
+    the ratio is untrustworthy whatever its cause (defect 4, 2026-11-08). The
+    old assertion here (`investigate is False`) encoded exactly the mask the
+    live 2026-11-07T15:25Z row hit — 191% explained, stamped "normal context".
+    """
     start, end = "2026-09-15T01:05:00+00:00", "2026-09-15T01:10:00+00:00"  # peak band
     tokens = {"input": 5000, "cached": 4800, "output": 100}
     per = _reconciled([_span(start=start, **tokens)])
@@ -297,7 +303,10 @@ def test_over_attribution_denominator_artifact_is_not_flagged():
     )
     assert diag["explained_cost_pct"] > 200
     assert diag["reason"] != "over_attributed"
-    assert diag["investigate"] is False
+    assert diag["reason"] == "unexplained_over_attribution"
+    assert diag["investigate"] is True
+    assert diag["actionable"] is False
+    assert diag["signature"] is None
 
 
 def test_over_attribution_is_caught_not_clamped():
