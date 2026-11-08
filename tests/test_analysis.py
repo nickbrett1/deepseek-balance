@@ -1089,3 +1089,150 @@ def test_history_table_labels_explained_pct_column():
     # labelled column rather than riding in the cache-hit column.
     assert "<th>Explains</th>" in app.HISTORY_HTML
     assert "costHint(diag)" in app.HISTORY_HTML
+
+
+# --- Defect 4: a materially over-attributed row must not read benign ---------
+#
+# The live 2026-11-07T15:25Z row reconciled 0.668052456 of traced cost against a
+# 0.35 balance drop (190.87%) and still came out `high_activity_cached` /
+# investigate=false, because the cache-hit benign branch never looked at the
+# ratio. The split that matters: 447 model-284 spans explain the $0.35 drop well
+# (~$0.346), while 28 model-56 spans carry $1.65 of traced cost in Phoenix, much
+# of it recorded under `gemini/gemini-flash-latest` while the response model —
+# and therefore the token pricing — says deepseek-v4-flash.
+
+_LIVE_ROW_EXPLAINED_PCT = 190.87213028571446  # 0.668052456 / 0.34999999999999964
+
+
+def _well_cached_flash_spans(n: int = 24) -> list[dict]:
+    """The model-284 population: many requests, ~97% of input served from cache."""
+    return [
+        _span(
+            "deepseek-v4-flash", input=60_000, cached=58_000, output=250,
+            cost=0.004, start="2026-11-07T15:26:00+00:00",
+        )
+        for _ in range(n)
+    ]
+
+
+def _defect4_spans() -> list[dict]:
+    """The live row in miniature: well-cached traffic + the mismatched provider.
+
+    Rich in requests with a high cache-hit ratio, so it falls through every
+    actionable rule to the benign `high_activity_cached` branch — which is
+    exactly where the mask bit.
+    """
+    return _well_cached_flash_spans() + [_provider_mismatch_span() for _ in range(3)]
+
+
+def test_material_over_attribution_is_not_called_benign():
+    """Reproduce the live row: 190.87% explained + provider_model_mismatch.
+
+    The verdict must not be the cached-benign one and must not be a quiet row.
+    """
+    spans = _defect4_spans()
+    traced = _reconciled(spans, start=_MEMO_ROW_START, end=_MEMO_ROW_END)
+    diag = heuristics.diagnose(
+        spans, window_spend=traced / (_LIVE_ROW_EXPLAINED_PCT / 100.0),
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["explained_cost_pct"] == pytest.approx(_LIVE_ROW_EXPLAINED_PCT, abs=0.01)
+
+    # Precondition: the traffic really does match the benign branch's shape, so
+    # the demotion is doing work rather than the rules having found something.
+    signals = diag["payload"]["signals"]
+    assert signals["request_count"] >= 20
+    assert signals["cache_hit_ratio"] >= 0.8
+    assert signals["pricing_gap"] is True
+
+    assert diag["reason"] != "high_activity_cached"
+    assert diag["reason"] == "unexplained_over_attribution"
+    assert diag["investigate"] is True
+    assert diag["actionable"] is False
+    assert diag["signature"] is None
+
+    # The label states the multiple plainly and names the pricing gap.
+    assert "1.9x the balance drop" in diag["reason_label"]
+    assert "gemini/gemini-flash-latest" in diag["reason_label"]
+    assert "3 request(s)" in diag["reason_label"]
+    assert "$0.16" in diag["reason_label"]  # 3 x $0.054075
+    assert "reconciliation unreliable" in diag["reason_label"]
+
+    # ...and the provider gap is in the summary, not just the payload.
+    assert "191%" in diag["summary"]
+    assert "pricing gap" in diag["summary"].lower()
+    assert "gemini/gemini-flash-latest" in diag["summary"]
+
+    # The evidence behind the demotion is stored on the row, auditable later.
+    health = diag["payload"]["reconciliation_health"]
+    assert health["over_threshold"] is True
+    assert health["multiple"] == pytest.approx(1.9087213028571446)
+    assert health["threshold_pct"] == heuristics.MATERIAL_OVER_ATTRIBUTION_PCT
+    assert health["provider_model_mismatch"]["requests"] == 3
+
+
+def test_genuinely_benign_cached_row_stays_benign():
+    """No regression: ~100% explained and no pricing gap stays a quiet row."""
+    spans = _well_cached_flash_spans()
+    traced = _reconciled(spans, start=_MEMO_ROW_START, end=_MEMO_ROW_END)
+    diag = heuristics.diagnose(
+        spans, window_spend=traced,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["explained_cost_pct"] == pytest.approx(100.0, abs=0.01)
+    assert diag["reason"] == "high_activity_cached"
+    assert diag["investigate"] is False
+    assert diag["signature"] == "high_activity_cached"
+    assert diag["reason_label"] == REASONS["high_activity_cached"]
+    assert diag["payload"]["reconciliation_health"] is None
+
+
+def test_over_attribution_threshold_alone_demotes_from_benign():
+    """The ratio alone is enough — no provider gap required."""
+    spans = _well_cached_flash_spans()
+    traced = _reconciled(spans, start=_MEMO_ROW_START, end=_MEMO_ROW_END)
+    diag = heuristics.diagnose(
+        spans, window_spend=traced / 1.6,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["explained_cost_pct"] == pytest.approx(160.0, abs=0.01)
+    assert diag["pricing_gap"] is False
+    assert diag["reason"] == "unexplained_over_attribution"
+    assert diag["investigate"] is True
+    assert diag["reason_label"] == (
+        "Traced cost is 1.6x the balance drop — reconciliation unreliable"
+    )
+
+
+def test_over_attribution_just_below_threshold_stays_benign():
+    """The threshold is a boundary, not a rebaselined row hack: 149% is still
+    within measurement noise of the drop and keeps the benign verdict."""
+    spans = _well_cached_flash_spans()
+    traced = _reconciled(spans, start=_MEMO_ROW_START, end=_MEMO_ROW_END)
+    diag = heuristics.diagnose(
+        spans, window_spend=traced / 1.49,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["explained_cost_pct"] == pytest.approx(149.0, abs=0.01)
+    assert diag["reason"] == "high_activity_cached"
+    assert diag["investigate"] is False
+
+
+def test_provider_model_mismatch_alone_demotes_from_benign():
+    """A pricing gap makes the ratio untrustworthy even when it looks ~100%.
+
+    The token side is priced as deepseek-v4-flash while the provider says
+    gemini, so the reconciliation describes different requests than it claims —
+    that must surface as a verdict, not only as a payload field.
+    """
+    spans = _well_cached_flash_spans() + [_provider_mismatch_span()]
+    traced = _reconciled(spans, start=_MEMO_ROW_START, end=_MEMO_ROW_END)
+    diag = heuristics.diagnose(
+        spans, window_spend=traced,
+        window_start_utc=_MEMO_ROW_START, window_end_utc=_MEMO_ROW_END,
+    )
+    assert diag["explained_cost_pct"] == pytest.approx(100.0, abs=0.01)
+    assert diag["reason"] == "unexplained_over_attribution"
+    assert diag["investigate"] is True
+    assert "gemini/gemini-flash-latest" in diag["reason_label"]
+    assert "1 request(s)" in diag["reason_label"]
