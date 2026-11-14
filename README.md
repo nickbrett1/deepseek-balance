@@ -80,9 +80,13 @@ with spend × the interval width (e.g. `SPEND_SLICE_MINUTES`).
 
 The homepage widget (`/`) is a **compact today-only panel** with no navigation
 (it is iframed by the Homepage dashboard; point your dashboard's separate
-"history" link at `/history`). The full drill-in at `/history` pairs today's
-heartbeat & interval summary with the daily charts below (no horizontal
-scroll, so it works on a phone). Three separate charts show the previous days
+"history" link at `/history`). `/history` is the whole app and has no tabs of
+its own: it opens with the same today heartbeat and interval summary the card
+shows, so a tab back to the card would lead to a strict subset of the page you
+are on — the card is a summary delivered into someone else's layout, not a
+second view. The drill-in pairs today's heartbeat & interval summary with the
+daily charts below (no horizontal scroll, so it works on a phone). Three
+separate charts show the previous days
 (each range has its own scale, so no dual-axis juggling):
 
 1. **Spend per day** — total spend per complete day.

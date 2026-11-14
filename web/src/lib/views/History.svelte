@@ -341,14 +341,15 @@
   ];
 </script>
 
-<AppShell
-  title="DeepSeek Balance"
-  subtitle="spend, usage and why"
-  nav={[
-    { label: "Today", href: "/" },
-    { label: "History", href: "/history", current: true },
-  ]}
->
+<!--
+  No `nav`: this page has no sibling. `/` is not a second view of the same
+  data, it is the dashboard card — an iframe Homepage sizes, whose content is
+  the top of this page (today's heartbeat, then the interval bands). A tab row
+  between them offered a destination that showed strictly less, so "Today"
+  read as a view you could not get back from and "History" as a section of it.
+  The app is one page; the card is a summary delivered somewhere else.
+-->
+<AppShell title="DeepSeek Balance" subtitle="spend, usage and why">
   {#if historyError}
     <p class="error">{historyError}</p>
   {:else if !data}

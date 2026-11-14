@@ -284,9 +284,7 @@ test.describe("the drill-in", () => {
 });
 
 test.describe("both screens", () => {
-  test("carry the house frame and a tab row naming both views", async ({
-    page,
-  }) => {
+  test("carry the house frame and no tab row", async ({ page }) => {
     await mock(page);
     await open(page, "/history");
     await expect(page.locator(".topbar")).toContainText("DeepSeek Balance");
@@ -297,19 +295,16 @@ test.describe("both screens", () => {
       "house design system · @nb",
     );
 
-    // app-shell 1.10.0: a destination is a tab, not a pill. The card view is
-    // only reachable from the history page (Homepage iframes the card), so
-    // this row is the app's only navigation and it has to say where you are.
-    const nav = page.getByRole("navigation", { name: "Sections" });
-    await expect(nav.getByRole("link")).toHaveCount(2);
-    await expect(nav.getByRole("link", { name: "Today" })).toHaveAttribute(
-      "href",
-      "/",
-    );
-    await expect(nav.getByRole("link", { name: "History" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
+    // One page, so nothing to tab between. The nav used to offer "Today",
+    // which pointed at the Homepage card — a view whose content is the top of
+    // this very page. A destination that shows strictly less is not a sibling.
+    await expect(page.locator(".main-nav")).toHaveCount(0);
+    await expect(
+      page.getByRole("navigation", { name: "Sections" }),
+    ).toHaveCount(0);
+    // And no back pill either: the page is entered from a dashboard link, so
+    // there is no in-app parent to go back to.
+    await expect(page.locator(".topbar a.pill")).toHaveCount(0);
 
     await open(page, "/");
     // The card is iframed: no tabs pushing the balance down, and no back pill.
