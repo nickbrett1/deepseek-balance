@@ -6,6 +6,8 @@ import { defineConfig } from "vite";
 // the read-model; a second server would only duplicate them. So this builds to
 // static files that FastAPI serves from /assets, and the app is one bundle that
 // picks a view from `location.pathname`.
+const API_ORIGIN = "http://127.0.0.1:3000";
+
 export default defineConfig({
   plugins: [svelte(), tailwindcss()],
   resolve: {
@@ -25,10 +27,8 @@ export default defineConfig({
   // development-only stand-in -- and it points at the API port, not at a second
   // copy of the app.
   server: {
-    proxy: {
-      "/ui": "http://127.0.0.1:3000",
-      "/balance": "http://127.0.0.1:3000",
-      "/analysis": "http://127.0.0.1:3000",
-    },
+    proxy: Object.fromEntries(
+      ["/ui", "/balance", "/analysis"].map((route) => [route, API_ORIGIN]),
+    ),
   },
 });

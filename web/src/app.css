@@ -254,3 +254,28 @@
 .tone-info {
   color: var(--accent);
 }
+	.lede {
+		margin: 0 0 4px;
+		font-size: 15px;
+		font-weight: 600;
+		letter-spacing: -0.005em;
+		color: var(--ink);
+}
+	.sub-lede {
+		margin: 0 0 16px;
+		color: var(--ink-muted);
+		max-width: 60ch;
+}
+	.notice.accent {
+		border-left-color: var(--accent);
+		background: var(--accent-soft);
+}
+	.notice code {
+		color: var(--mark);
+}
+	.quiet {
+		color: var(--ink-faint);
+}
+	.muted {
+		color: var(--ink-muted);
+}

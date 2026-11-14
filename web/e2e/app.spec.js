@@ -256,13 +256,30 @@ test.describe("the drill-in", () => {
 });
 
 test.describe("both screens", () => {
-  test("carry the house frame and a link back", async ({ page }) => {
+  test("carry the house frame and a tab row naming both views", async ({
+    page,
+  }) => {
     await mock(page);
     await open(page, "/history");
     await expect(page.locator(".topbar")).toContainText("DeepSeek Balance");
-    await expect(page.locator(".topbar a.pill")).toHaveAttribute("href", "/");
+
+    // app-shell 1.10.0: a destination is a tab, not a pill. The card view is
+    // only reachable from the history page (Homepage iframes the card), so
+    // this row is the app's only navigation and it has to say where you are.
+    const nav = page.getByRole("navigation", { name: "Sections" });
+    await expect(nav.getByRole("link")).toHaveCount(2);
+    await expect(nav.getByRole("link", { name: "Today" })).toHaveAttribute(
+      "href",
+      "/",
+    );
+    await expect(nav.getByRole("link", { name: "History" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+
     await open(page, "/");
-    // The card is iframed: no back pill, and no footer navigation to nowhere.
+    // The card is iframed: no tabs pushing the balance down, and no back pill.
+    await expect(page.locator(".main-nav")).toHaveCount(0);
     await expect(page.locator(".topbar a.pill")).toHaveCount(0);
   });
 

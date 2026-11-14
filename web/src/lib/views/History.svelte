@@ -344,8 +344,10 @@
 <AppShell
   title="DeepSeek Balance"
   subtitle="spend, usage and why"
-  backHref="/"
-  backLabel="← widget"
+  nav={[
+    { label: "Today", href: "/" },
+    { label: "History", href: "/history", current: true },
+  ]}
 >
   {#if historyError}
     <p class="error">{historyError}</p>
