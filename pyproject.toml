@@ -25,6 +25,11 @@ dev = [
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.package-data]
+# The built frontend (web/dist) is copied next to this module by the image, so
+# the wheel carries the screens and the runtime needs nothing else.
+deepseek_balance = ["web/index.html", "web/assets/*"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

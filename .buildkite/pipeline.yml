@@ -25,6 +25,30 @@ steps:
       - ruff check src tests
       - pytest -q
 
+  - label: ":svelte: Build and test (frontend)"
+    key: web
+    agents:
+      queue: mac-studio-linux
+    plugins:
+      - docker#v5.13.0:
+          image: "mcr.microsoft.com/playwright:v1.65.0-noble"
+          # Apple silicon fleet: without this the multi-arch tag resolves to
+          # amd64 and the browser runs emulated.
+          platform: linux/arm64
+          workdir: /workdir
+    commands:
+      - cd web
+      - npm ci --no-audit --no-fund
+      - npm run lint
+      - npm run build
+      # The image ships the browser, but `npm ci` resolves @playwright/test to
+      # a patch release of its own; a mismatch exits 1 without a word.
+      - npx playwright install --with-deps chromium
+      # --list proves the suite was collected before it runs, and --reporter=line
+      # means a failure prints where it happened rather than as a bare exit code.
+      - npx playwright test --list
+      - npx playwright test --reporter=line
+
   - label: ":docker: Build and publish image (GHCR)"
     key: docker_publish
     depends_on:

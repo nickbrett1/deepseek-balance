@@ -1080,15 +1080,64 @@ def test_cost_bearing_model_booked_at_zero_is_surfaced():
     assert zero_entry["pricing_gap"] is True
 
 
-# --- Defect 3: the history table names the reconciliation column -------------
+# --- Defect 3: the table names the reconciliation column ---------------------
 
-def test_history_table_labels_explained_pct_column():
-    from deepseek_balance import app
+
+def test_analysis_view_model_names_the_explains_column():
+    from deepseek_balance import app as app_module
 
     # "Explains" is the traced-cost ÷ balance-drop ratio; it must be its own
-    # labelled column rather than riding in the cache-hit column.
-    assert "<th>Explains</th>" in app.HISTORY_HTML
-    assert "costHint(diag)" in app.HISTORY_HTML
+    # field rather than riding in the cache-hit percentage.
+    row = app_module._analyse_row(
+        {
+            "start_utc": "2026-11-07T15:25:00+00:00",
+            "spend": 0.35,
+            "diagnosis": {
+                "reason": "high_activity_cached",
+                "reason_label": "high activity, well cached",
+                "summary": "447 model-284 spans",
+                "cache_hit_ratio": 0.943,
+                "explained_cost_pct": 92.4,
+                "request_count": 447,
+            },
+        },
+        max_attempts=3,
+    )
+    assert row["explained_pct"] == 92
+    assert row["cache_pct"] == 94
+    assert row["requests"] == 447
+
+
+def test_analysis_view_model_separates_failed_from_pending():
+    """A window Phoenix gave up on must not read as "about to be analysed"."""
+    from deepseek_balance import app as app_module
+
+    gave_up = app_module._analyse_row(
+        {"analysis_attempts": 3, "analysis_error": "timeout"}, max_attempts=3
+    )
+    assert gave_up["status"] == {"label": "failed", "tone": "bad"}
+    assert "giving up" in gave_up["summary"]
+
+    retrying = app_module._analyse_row(
+        {"analysis_attempts": 1, "analysis_error": "timeout"}, max_attempts=3
+    )
+    assert retrying["status"]["label"] == "failed"
+    assert "retrying" in retrying["summary"]
+
+    pending = app_module._analyse_row({"analysis_attempts": 0}, max_attempts=3)
+    assert pending["status"]["label"] == "analysing"
+    assert pending["summary"] == "Awaiting the next analysis pass."
+
+
+def test_analysis_view_model_investigate_outranks_actionable():
+    from deepseek_balance import app as app_module
+
+    row = app_module._analyse_row(
+        {"diagnosis": {"investigate": True, "actionable": True, "reason": "over_attributed"}},
+        max_attempts=3,
+    )
+    assert row["status"]["label"] == "investigate"
+    assert row["label"] == "over_attributed"
 
 
 # --- Defect 4: a materially over-attributed row must not read benign ---------

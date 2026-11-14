@@ -6,6 +6,17 @@
 # builds the application. Stage 2 (runtime): copies only the build output /
 # virtualenv and production dependencies, keeping the final image small.
 
+# Stage 0 (web): the Svelte frontend, built with Node and then thrown away --
+# the runtime image stays a plain Python image, with no Node in it.
+FROM node:24-slim AS web
+WORKDIR /web
+# The lockfile first, so a dependency change is the only thing that misses the
+# layer cache.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.12-slim AS build
 WORKDIR /app
 COPY README.md pyproject.toml* requirements.txt* ./
@@ -20,6 +31,9 @@ RUN python -m venv /opt/venv \
          /opt/venv/bin/pip install --no-cache-dir .; \
        fi
 COPY . .
+# The frontend ships as package data next to this module, so the wheel is the
+# only artefact the runtime image needs.
+COPY --from=web /web/dist src/deepseek_balance/web
 RUN if [ -f requirements.txt ]; then \
       /opt/venv/bin/pip install --no-cache-dir -r requirements.txt; \
     elif [ -f pyproject.toml ]; then \

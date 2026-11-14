@@ -1,0 +1,256 @@
+@import "tailwindcss";
+@import "shadcn-svelte/tailwind.css";
+
+@theme inline {
+		--bg: #0f172a;
+		--bg-raised: rgba(30, 41, 59, 0.55);
+		--bg-sunken: rgba(15, 23, 42, 0.35);
+		--bg-hover: rgba(51, 65, 85, 0.5);
+		--bg-selected: #334155;
+		--line: rgba(148, 163, 184, 0.14);
+		--line-strong: rgba(148, 163, 184, 0.25);
+		--ink: #e2e8f0;
+		--ink-dim: #cbd5e1;
+		--ink-muted: rgba(226, 232, 240, 0.62);
+		--ink-faint: rgba(226, 232, 240, 0.42);
+		--accent: #7dd3fc;
+		--accent-soft: rgba(125, 211, 252, 0.14);
+		--ok: #6ee7b7;
+		--ok-bg: rgba(52, 211, 153, 0.15);
+		--warn: #fdba74;
+		--warn-bg: rgba(251, 146, 60, 0.15);
+		--bad: #fca5a5;
+		--bad-bg: rgba(248, 113, 113, 0.18);
+		--neutral: #94a3b8;
+		--neutral-bg: rgba(148, 163, 184, 0.15);
+		--mark: #fce4b8;
+		--mark-bg: rgba(252, 228, 184, 0.18);
+		--safe-top: env(safe-area-inset-top, 0px);
+		--safe-right: env(safe-area-inset-right, 0px);
+		--safe-bottom: env(safe-area-inset-bottom, 0px);
+		--safe-left: env(safe-area-inset-left, 0px);
+		--radius: 8px;
+		--radius-sm: 6px;
+		--radius-pill: 999px;
+		--sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+		--mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+	:root {
+		color-scheme: dark;
+}
+	* {
+		box-sizing: border-box;
+}
+	html, body {
+		background: var(--bg);
+		-webkit-text-size-adjust: 100%;
+}
+	body {
+		margin: 0;
+		font-family: var(--sans);
+		font-size: 13px;
+		line-height: 1.45;
+		color: var(--ink);
+		-webkit-font-smoothing: antialiased;
+}
+	a {
+		color: var(--accent);
+		text-decoration: none;
+}
+	a:hover {
+		text-decoration: underline;
+		text-underline-offset: 2px;
+}
+	img, svg, video, canvas, iframe, table {
+		max-width: 100%;
+}
+	code, kbd, .num {
+		font-family: var(--mono);
+		font-variant-numeric: tabular-nums;
+}
+	code {
+		font-size: 0.92em;
+		background: var(--bg-sunken);
+		border: 1px solid var(--line);
+		border-radius: 4px;
+		padding: 0 4px;
+}
+	::selection {
+		background: rgba(125, 211, 252, 0.28);
+}
+	:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+		border-radius: 3px;
+}
+	.micro {
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--ink-muted);
+}
+	.section-title {
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--ink-muted);
+		margin: 16px 0 6px;
+}
+	.card {
+		background: var(--bg-raised);
+		border: 1px solid var(--line);
+		border-radius: var(--radius);
+}
+	.pill {
+		display: inline-block;
+		font-size: 10px;
+		font-weight: 600;
+		padding: 1px 7px;
+		border-radius: var(--radius-pill);
+		white-space: nowrap;
+		background: var(--neutral-bg);
+		color: var(--neutral);
+}
+	.pill.ok {
+		background: var(--ok-bg);
+		color: var(--ok);
+}
+	.pill.warn {
+		background: var(--warn-bg);
+		color: var(--warn);
+}
+	.pill.bad {
+		background: var(--bad-bg);
+		color: var(--bad);
+}
+	.pill.info {
+		background: var(--accent-soft);
+		color: var(--accent);
+}
+	.seg {
+		display: inline-flex;
+		flex-wrap: wrap;
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		overflow: hidden;
+}
+	.seg button {
+		background: transparent;
+		color: var(--ink-dim);
+		border: 0;
+		padding: 5px 12px;
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+}
+	.seg button.on {
+		background: var(--bg-selected);
+		color: #f1f5f9;
+}
+	.seg button:disabled {
+		opacity: 0.35;
+		cursor: default;
+}
+	.btn {
+		background: transparent;
+		color: var(--ink-dim);
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		padding: 5px 12px;
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+}
+	.btn:hover:not(:disabled) {
+		background: var(--bg-hover);
+		color: #f1f5f9;
+}
+	.btn:disabled {
+		opacity: 0.35;
+		cursor: default;
+}
+	.btn.primary {
+		background: var(--accent-soft);
+		border-color: rgba(125, 211, 252, 0.4);
+		color: var(--accent);
+}
+	input[type="search"], input[type="text"] {
+		background: var(--bg-sunken);
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		color: var(--ink);
+		font: inherit;
+		font-size: 13.5px;
+		padding: 7px 10px;
+}
+	input[type="search"]::placeholder {
+		color: var(--ink-faint);
+}
+	input[type="checkbox"] {
+		accent-color: var(--accent);
+}
+	.notice {
+		border-left: 3px solid var(--neutral);
+		background: var(--neutral-bg);
+		border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+		padding: 6px 10px;
+		font-size: 12px;
+		color: var(--ink-dim);
+}
+	.notice.ok {
+		border-left-color: var(--ok);
+		background: var(--ok-bg);
+}
+	.notice.warn {
+		border-left-color: var(--warn);
+		background: var(--warn-bg);
+}
+	.notice.bad {
+		border-left-color: var(--bad);
+		background: var(--bad-bg);
+}
+	.notice.info {
+		border-left-color: var(--accent);
+		background: var(--accent-soft);
+}
+	.hint {
+		color: var(--ink-muted);
+		font-size: 11px;
+}
+	mark {
+		background: var(--mark-bg);
+		color: var(--mark);
+		border-radius: 2px;
+		padding: 0 1px;
+}
+
+@media (max-width: 600px) {
+	body {
+		font-size: 12.5px;
+		}
+}
+
+@media (pointer: coarse), (max-width: 600px) {
+	input[type="search"], input[type="text"] {
+		font-size: 16px;
+		padding: 6px 10px;
+		}
+}
+
+/* App-local helpers, deliberately not theme: a table cell carries a *tone* on a
+   figure the tone belongs to ("6 (15%)" is the warning, not the row). The theme
+   tints pills and stat cards; these colour text. */
+.tone-ok {
+  color: var(--ok);
+}
+.tone-warn {
+  color: var(--warn);
+}
+.tone-bad {
+  color: var(--bad);
+}
+.tone-info {
+  color: var(--accent);
+}

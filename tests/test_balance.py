@@ -179,26 +179,54 @@ def test_history_with_data(client):
     assert pts and pts[-1]["total_balance"] == 30.0
 
 
-def test_index_serves_widget(client):
+def test_index_serves_the_built_bundle(client, tmp_path, monkeypatch):
+    """`/` is the built frontend, not a string in this module."""
+    from deepseek_balance import app as app_module
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><div id=app></div>")
+    monkeypatch.setattr(app_module, "WEB_DIST_DIR", dist)
+
     r = client.get("/")
     assert r.status_code == 200
-    assert "DeepSeek Balance" in r.text
-    assert "Today’s heartbeat" in r.text
-    assert "spend_summary" in r.text
+    assert r.headers["cache-control"] == "no-store"
+    assert 'id=app' in r.text
+    # One bundle, two screens: the page routes itself from the pathname.
+    assert client.get("/history").text == r.text
 
 
-def test_index_is_compact_and_history_is_the_drill_in(client):
-    """Homepage widget shows only today; the charts live on the /history page."""
-    root = client.get("/").text
-    drill = client.get("/history").text
-    # The iframed homepage widget must stay compact — no day charts here.
-    assert "Cost per hour" not in root
-    assert "Spend per day" not in root
-    assert "Today’s heartbeat" in root
-    # Drill-in carries the daily charts.
-    assert "Cost per hour" in drill
-    assert "Spend per day" in drill
-    assert "Usage time per day" in drill
+def test_the_frontend_says_so_when_it_has_not_been_built(client, tmp_path, monkeypatch):
+    from deepseek_balance import app as app_module
+
+    monkeypatch.setattr(app_module, "WEB_DIST_DIR", tmp_path / "absent")
+    r = client.get("/")
+    assert r.status_code == 503
+    assert "npm run build" in r.json()["detail"]
+
+
+def test_widget_is_compact_and_history_is_the_drill_in(client):
+    """The homepage card shows today; the daily series lives on the drill-in."""
+    db = app.state.db
+    now = datetime.now(UTC)
+    # Yesterday exists so the complete-day series is not empty: today is
+    # deliberately excluded from it.
+    _insert(db, (now - timedelta(days=1, hours=2)).isoformat(), 104.0)
+    _insert(db, (now - timedelta(hours=3)).isoformat(), 100.0)
+    _insert(db, now.isoformat(), 96.0)
+
+    widget = client.get("/ui/widget.json").json()
+    assert widget["available"] is True
+    # Exactly the card's fields: no series, no analysis, nothing to scroll past.
+    assert set(widget) == {"available", "currency", "pacing", "today", "summary"}
+    assert "series" not in widget["today"]
+    assert widget["pacing"]["label"] == "no baseline"  # one day, no median yet
+
+    drill = client.get("/ui/history.json").json()
+    assert drill["series"], "the drill-in carries the complete-day series"
+    assert drill["summary"]["slice_minutes"] == 5
+    assert drill["today"]["current_balance"] == 96.0
+    assert "series" not in widget
 
 
 # --- daily heartbeat analytics ----------------------------------------------

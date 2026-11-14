@@ -330,6 +330,67 @@ For agent follow-up, the MCP server exposes `high_interval_diagnoses` (filter by
 returns each high interval with its reason, summary, reconciliation stats and
 per-model breakdown, plus the raw signals when `include_signals` is set.
 
+## The frontend, and why FastAPI is still here
+
+Both screens are a Svelte 5 app in `web/`, built by Vite into static files that
+FastAPI serves from `src/deepseek_balance/web`. The blocks come from the `@nb`
+registry (theme + `app-shell`, `stat-strip`, `bar-series`, `data-table`), so the
+markup is the design system's, not this project's.
+
+```bash
+cd web
+npm install
+npm run build          # -> web/dist, which the image copies next to the module
+npm run dev            # http://127.0.0.1:5173, proxying /ui and /balance to :3000
+```
+
+What did **not** move, and why:
+
+| stays in FastAPI | why it cannot move |
+| --- | --- |
+| the SQLite store and the poller | it is the only writer, and the poll is wall-clock anchored |
+| the analytics (`analytics.py`, `analysis.py`, `bursts.py`) | the day boundary, the slice grid and the spike rule are domain rules |
+| `/balance/*`, `/spend/*`, `/analysis/*` | the MCP server and the agents already call them; a view-model must not become the API |
+| the pacing verdict (`0.7`/`1.3` bands) | "is today normal" is a rule, not a colour |
+| the diagnosis verdict (`investigate`/`actionable`/`fine`/`failed`) | and `failed` is not `pending`: a window Phoenix gave up on must not read as waiting |
+
+What the browser now owns is presentation only: money and duration formatting,
+the day labels, the projection bar, and the range picker.
+
+The two view-models exist because both screens must agree about *today*, and a
+second calculation would be a second answer:
+
+| endpoint | what it is |
+| --- | --- |
+| `GET /ui/widget.json?now=` | the card: one pacing verdict, four numbers, today's interval summary |
+| `GET /ui/history.json?days=&now=` | the drill-in: today's panel **and** the complete-day series in one fetch |
+| `GET /ui/analysis.json?status=&before=&limit=` | the diagnosis table, each row with its verdict and its `explained_pct` |
+
+`now` is the viewer's local time with an offset. The container runs in UTC; the
+reader does not, and "today" is the reader's day.
+
+### Tests, split on the data boundary
+
+- **pytest** owns the contract: `tests/test_views.py` pins what `/ui/*` carries,
+  that today is excluded from the series, and that `/` is the built bundle (503
+  with the command if it is not built).
+- **Playwright** owns the render: `web/e2e/` mocks `/ui/*.json` and asserts what
+  a reader sees, including that the widget still posts
+  `homepage-iframe-resize` — the one contract with Homepage that cannot break.
+
+```bash
+python -m pytest -q          # 145 tests, no browser needed
+cd web && npm run e2e        # 15 tests against `vite preview`, no Python needed
+```
+
+### One contract worth naming
+
+`/` is iframed by the Homepage dashboard, so the widget measures `<body>` and
+posts `homepage-iframe-resize` on load and every 1.5s. Measure
+`documentElement` instead and the card grows a little on every tick: once the
+parent stretches the iframe, `scrollHeight` starts reporting the iframe's own
+height rather than the content's.
+
 ## Deployment
 
 See `deploy/README.md` for the deployment runbook (CircleCI -> GHCR ->

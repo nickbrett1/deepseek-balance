@@ -33,5 +33,8 @@ venv/
 *.manifest
 *.egg-info/
 
-
-
+# The frontend is built in the image, not committed.
+web/dist
+web/node_modules
+web/test-results
+web/playwright-report

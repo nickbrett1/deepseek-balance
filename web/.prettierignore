@@ -1,0 +1,15 @@
+dist
+node_modules
+test-results
+playwright-report
+package-lock.json
+
+# Published bytes, not ours: these files are installed by
+# `shadcn-svelte add --overwrite` from the @nb registry, and formatting them
+# here would silently diverge from what the registry serves (and make the next
+# install look like a change).
+src/lib/components/nb
+
+# Generated: `registry:theme` merges the theme's cssVars and rules into this
+# file, so its formatting is the theme's, not ours.
+src/app.css
