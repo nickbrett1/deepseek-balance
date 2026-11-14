@@ -159,6 +159,7 @@
 </script>
 
 <AppShell
+  embedded
   title="DeepSeek Balance"
   subtitle={data?.available === false
     ? "no snapshot yet"

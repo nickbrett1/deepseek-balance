@@ -85,27 +85,55 @@ test.describe("the homepage widget", () => {
     await expect(page.locator(".figure")).toHaveCount(0);
   });
 
-  test("tells the Homepage parent how tall it is, measured from <body>", async ({
+  test("reports its content height, not the height of the iframe it was given", async ({
     page,
   }) => {
     await mock(page);
     // The same-origin iframe is the contract: Homepage embeds `/` in one and
-    // resizes the card from this message.
+    // resizes the card from this message. It is deliberately much taller than
+    // the card's content -- the whole bug was that the card measured the frame
+    // it had already been given and asked for more on every poll.
+    const VIEWPORT = 900;
     await page.setContent(
-      `<iframe src="${ORIGIN}/" style="width:380px;height:900px;border:0"></iframe>`,
+      `<iframe src="${ORIGIN}/" style="width:380px;height:${VIEWPORT}px;border:0"></iframe>`,
     );
-    const message = await page.evaluate(
+
+    // Let the card paint before taking the two polls: the reporter's interval
+    // starts at mount, and a report taken mid-load is legitimately short.
+    const card = page.frameLocator("iframe");
+    await expect(card.locator(".figure")).toBeVisible();
+
+    const heights = await page.evaluate(
       () =>
         new Promise((resolve) => {
-          window.addEventListener("message", (event) => {
-            if (event.data?.type === "homepage-iframe-resize")
-              resolve(event.data);
-          });
-          setTimeout(() => resolve(null), 5000);
+          const seen = [];
+          const onMessage = (event) => {
+            if (event.data?.type !== "homepage-iframe-resize") return;
+            seen.push(event.data.height);
+            if (seen.length === 2) {
+              window.removeEventListener("message", onMessage);
+              resolve(seen);
+            }
+          };
+          window.addEventListener("message", onMessage);
+          setTimeout(() => resolve(seen), 7000);
         }),
     );
-    expect(message).not.toBeNull();
-    expect(message.height).toBeGreaterThan(100);
+
+    expect(heights).toHaveLength(2);
+    // Content height, so strictly shorter than the 900px frame it was given.
+    expect(heights[0]).toBeLessThan(VIEWPORT);
+    expect(heights[1]).toBeLessThan(VIEWPORT);
+    // And the second poll must not ask for more: that is the feedback loop.
+    expect(heights[1]).toBeLessThanOrEqual(heights[0]);
+  });
+
+  test("drops the house footer when embedded, because the parent owns the chrome", async ({
+    page,
+  }) => {
+    await mock(page);
+    await open(page, "/");
+    await expect(page.locator(".footer")).toHaveCount(0);
   });
 });
 
@@ -262,6 +290,12 @@ test.describe("both screens", () => {
     await mock(page);
     await open(page, "/history");
     await expect(page.locator(".topbar")).toContainText("DeepSeek Balance");
+
+    // A page is still a page: it keeps the default house footer. Only the
+    // embedded card opts out (app-shell 1.11.0's `embedded` prop).
+    await expect(page.locator(".footer")).toContainText(
+      "house design system · @nb",
+    );
 
     // app-shell 1.10.0: a destination is a tab, not a pill. The card view is
     // only reachable from the history page (Homepage iframes the card), so
