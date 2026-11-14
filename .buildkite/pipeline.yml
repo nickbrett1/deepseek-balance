@@ -57,6 +57,10 @@ steps:
         export COMPONENTS_REGISTRY_URL="$$(doppler secrets get COMPONENTS_REGISTRY_URL --project common --config dev --plain)"
         echo "registry: $$COMPONENTS_REGISTRY_URL"
         node scripts/check-nb-blocks.mjs
+        # A block names a role, never a value (ui-registry scripts/check-tokens.mjs).
+        # The theme is the one file allowed a literal, because a token table is made
+        # of them; everything else must say var(--role), or a re-skin silently skips it.
+        node scripts/check-tokens.mjs web/src --theme web/src/app.css
       - cd web
       - npm ci --no-audit --no-fund
       - npm run lint
