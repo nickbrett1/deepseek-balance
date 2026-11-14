@@ -36,7 +36,27 @@ steps:
           # amd64 and the browser runs emulated.
           platform: linux/arm64
           workdir: /workdir
+          environment:
+            - DOPPLER_TOKEN
     commands:
+      - |
+        # The vendored @nb blocks are copies, and a copy nobody checks is the
+        # defect this step exists for: 1.11.0's app-shell fix reached a consumer
+        # because a Homepage card grew blank space, not because CI said so. This
+        # asks the registry whether the files in web/src/lib/components/nb/ still
+        # match the release this repo pins in .nb-registry.json -- and whether
+        # that release publishes them at all.
+        #
+        # The base comes from Doppler and is a HOST: the version lives in the
+        # repo whose bytes are at stake, so it is named once (spec: ui-registry
+        # README, "Keeping a consumer on published bytes").
+        if ! command -v doppler >/dev/null 2>&1; then
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+          curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh | sh
+        fi
+        export COMPONENTS_REGISTRY_URL="$$(doppler secrets get COMPONENTS_REGISTRY_URL --project common --config dev --plain)"
+        echo "registry: $$COMPONENTS_REGISTRY_URL"
+        node scripts/check-nb-blocks.mjs
       - cd web
       - npm ci --no-audit --no-fund
       - npm run lint
