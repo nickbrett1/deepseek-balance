@@ -47,6 +47,15 @@
    *                chrome and the parent owns the surroundings); an explicit
    *                `footer` snippet still renders, because then the consumer
    *                asked for it.
+   *   `footer`  -- three states, not two (1.12.0). Omitted: the house strip on
+   *                a page, nothing in a card. A snippet: the caller's own strip.
+   *                `false`: no footer at all, on a page. data-download wanted
+   *                that -- "the page ends where the content ends" is asserted by
+   *                its own tests -- and its only options were to fork the block
+   *                (which is what it did, invisibly, until a diff found it) or
+   *                to have `embedded`'s rules applied to a page, losing the
+   *                min-height that a page needs. A system whose answer to "not
+   *                this one thing" is "fork it" gets forked.
    *
    * The bar and the main column also honour the safe-area insets on a phone, so
    * an app added to a home screen does not put its nav under the clock.
@@ -117,7 +126,9 @@
     {@render children?.()}
   </main>
 
-  {#if footer}
+  {#if footer === false}
+    <!-- explicitly no footer: see the `footer` note above -->
+  {:else if footer}
     <footer class="footer">
       <div class="footer-inner">
         {@render footer()}
