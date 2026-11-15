@@ -3,8 +3,9 @@
    * AppShell — the house application frame.
    *
    * Replaces the bespoke top bars in stratechery-search, deepseek-balance and
-   * data-download. Sticky header with a backdrop blur, wordmark + micro subtitle,
-   * back pill for non-root views, 68rem main, and a footer strip.
+   * data-download. Sticky header on an opaque ground (not a blur — see the
+   * `.topbar` rule and 1.16.0), wordmark + micro subtitle, back pill for
+   * non-root views, 68rem main, and a footer strip.
    *
    * Two slots, added in 1.4.0 because the three consumers all needed them and
    * all three had to bypass the block to get them:
@@ -179,11 +180,16 @@
     top: 0;
     padding-top: var(--safe-top, 0px);
     z-index: 20;
-    /* Derived from the ground token, not a literal: the bar is the page
-       colour at 88%, which is what makes the blur read as glass. */
-    background: color-mix(in srgb, var(--bg) 88%, transparent);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    /* An opaque ground, not glass. This bar was `color-mix(--bg 88%)` plus a
+       `backdrop-filter: blur(8px)`, and in a browser tab that reads as glass
+       while in an iOS home-screen window it reads as a grey smear: iOS
+       composites the status-bar band through the translucent layer, so 12% of
+       whatever is scrolling under the bar plus a blur of it lifts the strip
+       and the ink on it stops being legible. The bar is the top edge of the
+       viewport on every device and it owns that band -- there is nothing above
+       it to see through to. Consumers get this by re-vendoring; nobody has to
+       opt in. */
+    background: var(--bg);
     border-bottom: 1px solid var(--line);
   }
 
