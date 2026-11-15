@@ -17,8 +17,37 @@
       name="apple-mobile-web-app-status-bar-style"
       content="black-translucent"
     />
+    <style>
+      /* iOS standalone samples the top of the viewport and blurs what is under
+         it, so an opaque bar is not enough on its own: WebKit looks for a fixed
+         box at the top edge, at least 90% of the width, with a background
+         thicker than 10px, and without one it blurs the content instead. This
+         is that box -- empty, fixed, full width, 11px. `background-clip: text`
+         clips its background to no text at all, so WebKit gets a colour to
+         sample and nothing is painted over the controls.
+         See ui-registry README, "The iOS top-edge surface". */
+      .pwa-status-bar-surface {
+        display: none;
+      }
+      @supports (-webkit-touch-callout: none) and (background-clip: text) {
+        @media (display-mode: standalone) {
+          .pwa-status-bar-surface {
+            display: block;
+            position: fixed;
+            inset: 0 0 auto;
+            height: 11px; /* Must exceed WebKit's 10px thin-border threshold. */
+            z-index: 100;
+            pointer-events: none;
+            background-color: inherit;
+            -webkit-background-clip: text;
+            background-clip: text;
+          }
+        }
+      }
+    </style>
   </head>
   <body>
+    <div class="pwa-status-bar-surface" aria-hidden="true"></div>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
