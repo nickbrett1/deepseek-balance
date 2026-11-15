@@ -2,10 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover"
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- No `viewport-fit=cover`. With it the web view extends under the iOS
+         status bar, `env(safe-area-inset-top)` is non-zero, and whatever the
+         system draws in that band lands on this app's own top bar -- which is
+         what "murky top bar" was, through four attempts at repainting our side
+         of it. Without it the viewport starts below the band and there is
+         nothing of ours to composite over. The colour surface in <style> stays
+         for the full-bleed case a future layout might want. -->
     <title>DeepSeek Balance</title>
     <!-- Dark from the first paint: the widget is iframed inside a dashboard, and
          a white flash there is a white flash in someone else's page. -->
