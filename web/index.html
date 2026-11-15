@@ -13,10 +13,13 @@
     <meta name="color-scheme" content="dark" />
     <meta name="apple-mobile-web-app-title" content="DeepSeek" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta
-      name="apple-mobile-web-app-status-bar-style"
-      content="black-translucent"
-    />
+    <!-- Opaque, not translucent. `black-translucent` is the value that invites
+         the page to be drawn *under* the status bar, and that band is the one
+         place a home-screen window can composite something over our own bar.
+         `black` asks for a solid strip with the page starting below it, so the
+         top of the UI is our CSS and nothing else. Costs a black strip above a
+         dark navy one; a crisp top nav is worth more than a seamless seam. -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <style>
       /* iOS standalone samples the top of the viewport and blurs what is under
          it, so an opaque bar is not enough on its own: WebKit looks for a fixed
@@ -35,7 +38,9 @@
             display: block;
             position: fixed;
             inset: 0 0 auto;
-            height: 11px; /* Must exceed WebKit's 10px thin-border threshold. */
+            /* 11px clears the 10px thin-border threshold; the inset is added
+               because the band WebKit composites over is the safe area. */
+            height: calc(11px + env(safe-area-inset-top, 0px));
             z-index: 100;
             pointer-events: none;
             background-color: inherit;
