@@ -210,8 +210,11 @@ def test_widget_is_compact_and_history_is_the_drill_in(client):
     db = app.state.db
     now = datetime.now(UTC)
     # Yesterday exists so the complete-day series is not empty: today is
-    # deliberately excluded from it.
-    _insert(db, (now - timedelta(days=1, hours=2)).isoformat(), 104.0)
+    # deliberately excluded from it. Exactly one day back, not "a day and a
+    # couple of hours" -- before 02:00 UTC that subtraction lands on the day
+    # before yesterday, which is two complete days and therefore a baseline.
+    # This test then failed once a day, at 01:57, with "above normal".
+    _insert(db, (now - timedelta(days=1)).isoformat(), 104.0)
     _insert(db, (now - timedelta(hours=3)).isoformat(), 100.0)
     _insert(db, now.isoformat(), 96.0)
 
